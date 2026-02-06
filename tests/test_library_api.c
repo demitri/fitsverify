@@ -88,15 +88,120 @@ int main(void)
     CHECK(result.num_errors > 0 || result.num_warnings > 0,
           "dup extname file has errors or warnings");
 
-    /* ---- 8. Accumulated totals ---- */
-    printf("\n8. Accumulated totals\n");
+    /* ---- 8. Accumulated totals (after file-based tests) ---- */
+    printf("\n8. Accumulated totals (file-based)\n");
     fv_get_totals(ctx, &toterr, &totwrn);
     CHECK(toterr >= 0, "total errors >= 0");
     CHECK(totwrn >= 0, "total warnings >= 0");
     printf("   (totals: %ld errors, %ld warnings)\n", toterr, totwrn);
 
-    /* ---- 9. Context free ---- */
-    printf("\n9. Context free\n");
+    /* ---- 9. In-memory verification: valid file ---- */
+    printf("\n9. Verify valid_minimal.fits from memory\n");
+    {
+        FILE *fp;
+        long fsize;
+        void *buf;
+
+        fp = fopen("valid_minimal.fits", "rb");
+        CHECK(fp != NULL, "opened valid_minimal.fits for reading");
+        if (fp) {
+            fseek(fp, 0, SEEK_END);
+            fsize = ftell(fp);
+            fseek(fp, 0, SEEK_SET);
+            buf = malloc(fsize);
+            CHECK(buf != NULL, "allocated buffer for valid_minimal.fits");
+            if (buf) {
+                fread(buf, 1, fsize, fp);
+                fclose(fp);
+
+                memset(&result, 0, sizeof(result));
+                rc = fv_verify_memory(ctx, buf, (size_t)fsize,
+                                      "valid_minimal.fits", NULL, &result);
+                CHECK(rc == 0, "fv_verify_memory returns 0 for valid data");
+                CHECK(result.num_errors == 0, "memory: valid file has 0 errors");
+                CHECK(result.num_warnings == 0, "memory: valid file has 0 warnings");
+                CHECK(result.num_hdus >= 1, "memory: valid file has >= 1 HDU");
+                CHECK(result.aborted == 0, "memory: valid file not aborted");
+                free(buf);
+            } else {
+                fclose(fp);
+            }
+        }
+    }
+
+    /* ---- 10. In-memory verification: bad file ---- */
+    printf("\n10. Verify err_bad_bitpix.fits from memory\n");
+    {
+        FILE *fp;
+        long fsize;
+        void *buf;
+
+        fp = fopen("err_bad_bitpix.fits", "rb");
+        CHECK(fp != NULL, "opened err_bad_bitpix.fits for reading");
+        if (fp) {
+            fseek(fp, 0, SEEK_END);
+            fsize = ftell(fp);
+            fseek(fp, 0, SEEK_SET);
+            buf = malloc(fsize);
+            CHECK(buf != NULL, "allocated buffer for err_bad_bitpix.fits");
+            if (buf) {
+                fread(buf, 1, fsize, fp);
+                fclose(fp);
+
+                memset(&result, 0, sizeof(result));
+                rc = fv_verify_memory(ctx, buf, (size_t)fsize,
+                                      NULL, NULL, &result);
+                CHECK(result.num_errors > 0,
+                      "memory: bad bitpix has > 0 errors");
+                free(buf);
+            } else {
+                fclose(fp);
+            }
+        }
+    }
+
+    /* ---- 11. In-memory verification: NULL label defaults ---- */
+    printf("\n11. Verify memory with NULL label\n");
+    {
+        FILE *fp;
+        long fsize;
+        void *buf;
+
+        fp = fopen("valid_minimal.fits", "rb");
+        if (fp) {
+            fseek(fp, 0, SEEK_END);
+            fsize = ftell(fp);
+            fseek(fp, 0, SEEK_SET);
+            buf = malloc(fsize);
+            if (buf) {
+                fread(buf, 1, fsize, fp);
+                fclose(fp);
+
+                memset(&result, 0, sizeof(result));
+                rc = fv_verify_memory(ctx, buf, (size_t)fsize,
+                                      NULL, NULL, &result);
+                CHECK(rc == 0, "fv_verify_memory with NULL label returns 0");
+                free(buf);
+            } else {
+                fclose(fp);
+            }
+        }
+    }
+
+    /* ---- 12. Accumulated totals (after file + memory tests) ---- */
+    printf("\n12. Accumulated totals (file + memory)\n");
+    {
+        long toterr2, totwrn2;
+        fv_get_totals(ctx, &toterr2, &totwrn2);
+        CHECK(toterr2 >= toterr,
+              "total errors after memory tests >= after file tests");
+        CHECK(toterr2 >= 0, "total errors still >= 0");
+        CHECK(totwrn2 >= 0, "total warnings still >= 0");
+        printf("   (totals: %ld errors, %ld warnings)\n", toterr2, totwrn2);
+    }
+
+    /* ---- 13. Context free ---- */
+    printf("\n13. Context free\n");
     fv_context_free(ctx);
     printf("  PASS: fv_context_free did not crash\n");
     n_pass++;

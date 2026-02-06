@@ -19,5 +19,18 @@ add_executable(test_abort test_abort.c)
 target_link_libraries(test_abort fitsverify)
 target_include_directories(test_abort PRIVATE ${CFITSIO_INCLUDE_DIRS})
 
+# Output callback test
+add_executable(test_output_callback test_output_callback.c)
+target_link_libraries(test_output_callback fitsverify)
+target_include_directories(test_output_callback PRIVATE ${CFITSIO_INCLUDE_DIRS})
+
+# Multi-threaded test
+find_package(Threads)
+if(Threads_FOUND)
+    add_executable(test_threaded test_threaded.c)
+    target_link_libraries(test_threaded fitsverify Threads::Threads)
+    target_include_directories(test_threaded PRIVATE ${CFITSIO_INCLUDE_DIRS})
+endif()
+
 # Copy regression test script to build dir
 configure_file(test_regression.sh ${CMAKE_CURRENT_BINARY_DIR}/test_regression.sh COPYONLY)

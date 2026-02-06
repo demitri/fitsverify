@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64", "cffi>=1.16"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fitsverify"
+version = "1.0.0"
+description = "FITS standards-compliance validator (Python bindings for libfitsverify)"
+requires-python = ">=3.9"
+license = {text = "BSD-3-Clause"}
+dependencies = ["cffi>=1.16"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: C",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Astronomy",
+]
+
+[project.urls]
+Homepage = "https://github.com/demitri/fitsverify"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
