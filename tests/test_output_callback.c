@@ -26,6 +26,10 @@ typedef struct {
     fv_msg_severity severity;
     int             hdu_num;
     char            text[512];
+    char            fix_hint[512];
+    char            explain[512];
+    int             has_fix_hint;
+    int             has_explain;
 } saved_message;
 
 static saved_message msgs[MAX_MSGS];
@@ -45,6 +49,22 @@ static void test_callback(const fv_message *msg, void *userdata)
         msgs[n_msgs].hdu_num  = msg->hdu_num;
         strncpy(msgs[n_msgs].text, msg->text, sizeof(msgs[n_msgs].text) - 1);
         msgs[n_msgs].text[sizeof(msgs[n_msgs].text) - 1] = '\0';
+        if (msg->fix_hint) {
+            strncpy(msgs[n_msgs].fix_hint, msg->fix_hint, sizeof(msgs[n_msgs].fix_hint) - 1);
+            msgs[n_msgs].fix_hint[sizeof(msgs[n_msgs].fix_hint) - 1] = '\0';
+            msgs[n_msgs].has_fix_hint = 1;
+        } else {
+            msgs[n_msgs].fix_hint[0] = '\0';
+            msgs[n_msgs].has_fix_hint = 0;
+        }
+        if (msg->explain) {
+            strncpy(msgs[n_msgs].explain, msg->explain, sizeof(msgs[n_msgs].explain) - 1);
+            msgs[n_msgs].explain[sizeof(msgs[n_msgs].explain) - 1] = '\0';
+            msgs[n_msgs].has_explain = 1;
+        } else {
+            msgs[n_msgs].explain[0] = '\0';
+            msgs[n_msgs].has_explain = 0;
+        }
         n_msgs++;
     }
 }
@@ -234,6 +254,302 @@ int main(void)
               "warning text starts with '*** Warning: '");
     } else {
         printf("  INFO: no warnings to check prefix on\n");
+    }
+    fv_context_free(ctx);
+
+    /* ---- 9. Hints disabled by default -> fix_hint/explain are NULL ---- */
+    printf("\n9. Hints disabled by default\n");
+    ctx = fv_context_new();
+    reset_msgs();
+    fv_set_output(ctx, test_callback, NULL);
+
+    memset(&result, 0, sizeof(result));
+    fv_verify_file(ctx, "err_dup_extname.fits", NULL, &result);
+    {
+        int any_hint = 0;
+        for (int i = 0; i < n_msgs; i++) {
+            if (msgs[i].has_fix_hint || msgs[i].has_explain) {
+                any_hint = 1;
+                break;
+            }
+        }
+        CHECK(!any_hint, "no hints when options disabled");
+    }
+    fv_context_free(ctx);
+
+    /* ---- 10. FV_OPT_FIX_HINTS -> fix_hint populated on warnings ---- */
+    printf("\n10. fix_hints enabled -> fix_hint on warnings\n");
+    ctx = fv_context_new();
+    fv_set_option(ctx, FV_OPT_FIX_HINTS, 1);
+    reset_msgs();
+    fv_set_output(ctx, test_callback, NULL);
+
+    memset(&result, 0, sizeof(result));
+    fv_verify_file(ctx, "err_dup_extname.fits", NULL, &result);
+    {
+        int got_hint = 0;
+        for (int i = 0; i < n_msgs; i++) {
+            if (msgs[i].severity == FV_MSG_WARNING && msgs[i].has_fix_hint) {
+                got_hint = 1;
+                break;
+            }
+        }
+        CHECK(got_hint, "warning has fix_hint when FV_OPT_FIX_HINTS=1");
+    }
+    /* explain should still be NULL */
+    {
+        int any_explain = 0;
+        for (int i = 0; i < n_msgs; i++) {
+            if (msgs[i].has_explain) {
+                any_explain = 1;
+                break;
+            }
+        }
+        CHECK(!any_explain, "no explain when FV_OPT_EXPLAIN=0");
+    }
+    fv_context_free(ctx);
+
+    /* ---- 11. FV_OPT_EXPLAIN -> explain populated on warnings ---- */
+    printf("\n11. explain enabled -> explain on warnings\n");
+    ctx = fv_context_new();
+    fv_set_option(ctx, FV_OPT_EXPLAIN, 1);
+    reset_msgs();
+    fv_set_output(ctx, test_callback, NULL);
+
+    memset(&result, 0, sizeof(result));
+    fv_verify_file(ctx, "err_dup_extname.fits", NULL, &result);
+    {
+        int got_explain = 0;
+        for (int i = 0; i < n_msgs; i++) {
+            if (msgs[i].severity == FV_MSG_WARNING && msgs[i].has_explain) {
+                got_explain = 1;
+                break;
+            }
+        }
+        CHECK(got_explain, "warning has explain when FV_OPT_EXPLAIN=1");
+    }
+    /* fix_hint should still be NULL */
+    {
+        int any_hint = 0;
+        for (int i = 0; i < n_msgs; i++) {
+            if (msgs[i].has_fix_hint) {
+                any_hint = 1;
+                break;
+            }
+        }
+        CHECK(!any_hint, "no fix_hint when FV_OPT_FIX_HINTS=0");
+    }
+    fv_context_free(ctx);
+
+    /* ---- 12. Both enabled -> both populated ---- */
+    printf("\n12. Both hints and explain enabled\n");
+    ctx = fv_context_new();
+    fv_set_option(ctx, FV_OPT_FIX_HINTS, 1);
+    fv_set_option(ctx, FV_OPT_EXPLAIN, 1);
+    reset_msgs();
+    fv_set_output(ctx, test_callback, NULL);
+
+    memset(&result, 0, sizeof(result));
+    fv_verify_file(ctx, "err_dup_extname.fits", NULL, &result);
+    {
+        int got_both = 0;
+        for (int i = 0; i < n_msgs; i++) {
+            if (msgs[i].severity == FV_MSG_WARNING
+                && msgs[i].has_fix_hint && msgs[i].has_explain) {
+                got_both = 1;
+                break;
+            }
+        }
+        CHECK(got_both, "warning has both fix_hint and explain");
+    }
+    fv_context_free(ctx);
+
+    /* ---- 13. INFO messages have no hints (they're structural) ---- */
+    printf("\n13. INFO messages have no hints\n");
+    ctx = fv_context_new();
+    fv_set_option(ctx, FV_OPT_FIX_HINTS, 1);
+    fv_set_option(ctx, FV_OPT_EXPLAIN, 1);
+    reset_msgs();
+    fv_set_output(ctx, test_callback, NULL);
+
+    memset(&result, 0, sizeof(result));
+    fv_verify_file(ctx, "err_dup_extname.fits", NULL, &result);
+    {
+        int info_with_hint = 0;
+        for (int i = 0; i < n_msgs; i++) {
+            if (msgs[i].severity == FV_MSG_INFO
+                && (msgs[i].has_fix_hint || msgs[i].has_explain)) {
+                info_with_hint = 1;
+                break;
+            }
+        }
+        CHECK(!info_with_hint, "INFO messages have no hints/explain");
+    }
+    fv_context_free(ctx);
+
+    /* ---- 14. fix_hints on error messages ---- */
+    printf("\n14. fix_hints on error messages\n");
+    ctx = fv_context_new();
+    fv_set_option(ctx, FV_OPT_FIX_HINTS, 1);
+    reset_msgs();
+    fv_set_output(ctx, test_callback, NULL);
+
+    memset(&result, 0, sizeof(result));
+    fv_verify_file(ctx, "err_bad_bitpix.fits", NULL, &result);
+    {
+        int got_err_hint = 0;
+        for (int i = 0; i < n_msgs; i++) {
+            if ((msgs[i].severity == FV_MSG_ERROR || msgs[i].severity == FV_MSG_SEVERE)
+                && msgs[i].has_fix_hint) {
+                got_err_hint = 1;
+                break;
+            }
+        }
+        CHECK(got_err_hint, "error has fix_hint when FV_OPT_FIX_HINTS=1");
+    }
+    fv_context_free(ctx);
+
+    /* ---- 15. Context-aware fix_hint contains keyword name ---- */
+    printf("\n15. Context-aware fix_hint contains keyword name\n");
+    ctx = fv_context_new();
+    fv_set_option(ctx, FV_OPT_FIX_HINTS, 1);
+    reset_msgs();
+    fv_set_output(ctx, test_callback, NULL);
+
+    memset(&result, 0, sizeof(result));
+    /* err_many_errors.fits has bad TDISPn keywords; the error hints
+       should include the keyword name (e.g., 'TDISP') */
+    fv_verify_file(ctx, "err_many_errors.fits", NULL, &result);
+    {
+        int hint_has_keyword = 0;
+        for (int i = 0; i < n_msgs; i++) {
+            if ((msgs[i].severity == FV_MSG_ERROR || msgs[i].severity == FV_MSG_SEVERE)
+                && msgs[i].has_fix_hint
+                && strstr(msgs[i].fix_hint, "TDISP")) {
+                hint_has_keyword = 1;
+                break;
+            }
+        }
+        CHECK(hint_has_keyword,
+              "error fix_hint contains keyword name 'TDISP'");
+    }
+    fv_context_free(ctx);
+
+    /* ---- 16. Context-aware explain contains FITS Standard reference ---- */
+    printf("\n16. Context-aware explain contains FITS Standard reference\n");
+    ctx = fv_context_new();
+    fv_set_option(ctx, FV_OPT_FIX_HINTS, 1);
+    fv_set_option(ctx, FV_OPT_EXPLAIN, 1);
+    reset_msgs();
+    fv_set_output(ctx, test_callback, NULL);
+
+    memset(&result, 0, sizeof(result));
+    fv_verify_file(ctx, "err_dup_extname.fits", NULL, &result);
+    {
+        /* explain text for warnings should reference the FITS Standard
+           or contain educational content */
+        int explain_has_ref = 0;
+        for (int i = 0; i < n_msgs; i++) {
+            if (msgs[i].severity == FV_MSG_WARNING
+                && msgs[i].has_explain
+                && (strstr(msgs[i].explain, "FITS Standard")
+                    || strstr(msgs[i].explain, "EXTNAME")
+                    || strstr(msgs[i].explain, "unique"))) {
+                explain_has_ref = 1;
+                break;
+            }
+        }
+        CHECK(explain_has_ref,
+              "warning explain contains educational content");
+    }
+    fv_context_free(ctx);
+
+    /* ---- 17. Context-aware warning hint contains keyword name ---- */
+    printf("\n17. Context-aware warning hint contains keyword name\n");
+    ctx = fv_context_new();
+    fv_set_option(ctx, FV_OPT_FIX_HINTS, 1);
+    reset_msgs();
+    fv_set_output(ctx, test_callback, NULL);
+
+    memset(&result, 0, sizeof(result));
+    fv_verify_file(ctx, "err_dup_extname.fits", NULL, &result);
+    {
+        /* err_dup_extname.fits triggers WARN_DUPLICATE_EXTNAME with
+           FV_HINT_SET_KEYWORD(ctx, "EXTNAME"); the hint should
+           contain 'EXTNAME' */
+        int warn_hint_has_kw = 0;
+        for (int i = 0; i < n_msgs; i++) {
+            if (msgs[i].severity == FV_MSG_WARNING
+                && msgs[i].has_fix_hint
+                && strstr(msgs[i].fix_hint, "EXTNAME")) {
+                warn_hint_has_kw = 1;
+                break;
+            }
+        }
+        CHECK(warn_hint_has_kw,
+              "warning fix_hint contains keyword name 'EXTNAME'");
+    }
+    fv_context_free(ctx);
+
+    /* ---- 18. Context-aware hint includes HDU number ---- */
+    printf("\n18. Context-aware hint includes HDU number\n");
+    ctx = fv_context_new();
+    fv_set_option(ctx, FV_OPT_FIX_HINTS, 1);
+    reset_msgs();
+    fv_set_output(ctx, test_callback, NULL);
+
+    memset(&result, 0, sizeof(result));
+    fv_verify_file(ctx, "err_many_errors.fits", NULL, &result);
+    {
+        /* The hint text should mention an HDU number */
+        int hint_has_hdu = 0;
+        for (int i = 0; i < n_msgs; i++) {
+            if ((msgs[i].severity == FV_MSG_ERROR || msgs[i].severity == FV_MSG_SEVERE)
+                && msgs[i].has_fix_hint
+                && strstr(msgs[i].fix_hint, "HDU")) {
+                hint_has_hdu = 1;
+                break;
+            }
+        }
+        CHECK(hint_has_hdu,
+              "error fix_hint includes HDU reference");
+    }
+    fv_context_free(ctx);
+
+    /* ---- 19. Fallback: static hints when no context ---- */
+    printf("\n19. Fallback: static hints for file-level errors\n");
+    ctx = fv_context_new();
+    fv_set_option(ctx, FV_OPT_FIX_HINTS, 1);
+    fv_set_option(ctx, FV_OPT_EXPLAIN, 1);
+    reset_msgs();
+    fv_set_output(ctx, test_callback, NULL);
+
+    memset(&result, 0, sizeof(result));
+    fv_verify_file(ctx, "err_dup_extname.fits", NULL, &result);
+    {
+        /* All error/warning messages that have hints should have
+           non-empty fix_hint and explain strings */
+        int all_valid = 1;
+        int found_any = 0;
+        for (int i = 0; i < n_msgs; i++) {
+            if (msgs[i].severity == FV_MSG_INFO) continue;
+            if (msgs[i].has_fix_hint) {
+                found_any = 1;
+                if (strlen(msgs[i].fix_hint) == 0) {
+                    all_valid = 0;
+                    break;
+                }
+            }
+            if (msgs[i].has_explain) {
+                found_any = 1;
+                if (strlen(msgs[i].explain) == 0) {
+                    all_valid = 0;
+                    break;
+                }
+            }
+        }
+        CHECK(found_any && all_valid,
+              "all hints have non-empty text (static or context-aware)");
     }
     fv_context_free(ctx);
 

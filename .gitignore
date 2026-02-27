@@ -1,3 +1,6 @@
+build/
+.claude/
+
 # Prerequisites
 *.d
 
@@ -53,3 +56,29 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+*.whl
+.eggs/
+
+# cffi build artifacts
+*_cffi_*.c
+*_cffi_*.o
+
+# Virtual environments
+.venv/
+venv/
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Sphinx build output
+docs/_build/

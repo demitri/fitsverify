@@ -4,7 +4,7 @@
  * Calls fv_verify_file on a file designed to trigger >200 errors.
  * If the library incorrectly calls exit(), this process will terminate
  * and the test runner will report a failure.  If the library correctly
- * uses longjmp, the function returns and we can inspect the result.
+ * uses a flag-based abort, the function returns and we can inspect the result.
  */
 #include <stdio.h>
 #include <stdlib.h>

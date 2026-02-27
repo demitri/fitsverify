@@ -18,30 +18,60 @@ The original code (~3,100 lines of C, dating to 1994/1998) was never designed fo
 demitri-fitsverify/
 ├── AI/
 │   ├── START_HERE.md          ← You are here
-│   └── TODO.md                ← Detailed task tracking (keep updated!)
-├── source/
-│   └── c/                     ← Original fitsverify 4.20 source (unmodified reference)
-│       ├── ftverify.c         ← Core verification orchestration
-│       ├── fitsverify.c       ← Standalone main() + HEADAS stubs
-│       ├── fverify.h          ← Shared header (types, externs, prototypes)
-│       ├── fvrf_head.c        ← Header validation + verify_fits() entry point (~3000 lines)
+│   ├── TODO.md                ← Detailed task tracking (keep updated!)
+│   ├── hints.md               ← Original starter hint catalog (now superseded by fv_hints.c)
+│   ├── Performance_and_Feature_Improvements.md  ← Feature ideas (most implemented)
+│   └── In-Memory HDU Multiprocessing Proposal.md  ← Evaluated and rejected
+├── libfitsverify/             ← Refactored C library
+│   ├── CMakeLists.txt
+│   ├── include/
+│   │   └── fitsverify.h       ← Public API header
+│   └── src/
+│       ├── fv_api.c           ← Public API implementation
+│       ├── fv_context.h       ← Internal context struct definition
+│       ├── fv_internal.h      ← Internal function prototypes
+│       ├── fv_hints.c         ← Context-aware fix hints and explanations
+│       ├── fv_hints.h         ← Hint types, macros, lookup API
+│       ├── fvrf_head.c        ← Header validation (~3000 lines)
 │       ├── fvrf_data.c        ← Data validation (tables, checksums)
 │       ├── fvrf_file.c        ← HDU error tracking, report init/close
 │       ├── fvrf_key.c         ← Keyword parsing and type checking
-│       ├── fvrf_misc.c        ← Output functions, error/warning counters
-│       ├── README             ← Original build instructions
-│       └── License.txt        ← NASA open source license
+│       └── fvrf_misc.c        ← Output functions, message dispatch
+├── cli/
+│   └── fitsverify.c           ← CLI wrapper (drop-in replacement)
+├── python/
+│   ├── pyproject.toml
+│   ├── src/fitsverify/
+│   │   ├── __init__.py
+│   │   ├── _build_ffi.py      ← cffi build script (compiles C sources)
+│   │   └── _core.py           ← Pythonic API (verify, VerificationResult, Issue)
+│   └── tests/
+│       └── test_verify.py     ← 44 pytest tests
+├── tests/                     ← C test suites (91 tests across 5 suites)
+│   ├── test_library_api.c
+│   ├── test_output_callback.c
+│   ├── test_abort.c
+│   ├── test_threaded.c
+│   ├── test_regression.sh
+│   └── gen_test_fits.c        ← Test FITS file generator
+├── docs/                      ← Sphinx documentation (ReadTheDocs theme)
+│   ├── conf.py
+│   ├── index.rst
+│   ├── installation.rst
+│   ├── quickstart.rst
+│   ├── python-api.rst
+│   ├── c-api.rst
+│   ├── cli.rst
+│   ├── error-codes.rst
+│   └── changelog.rst
+├── source/
+│   └── c/                     ← Original fitsverify 4.20 source (unmodified reference)
 ├── documentation/
 │   └── publication/
 │       └── Publication.md     ← Notes toward a publication (keep updated!)
 ├── fitsverify-archives/       ← Original distribution tarballs
 └── README.md
 ```
-
-As work progresses, new directories will be created:
-- `libfitsverify/` — refactored C library source
-- `cli/` — rebuilt command-line tool
-- `python/` — Python package
 
 ## Key Technical Context
 
@@ -104,8 +134,8 @@ main() [fitsverify.c]
 
 ### Keeping Documents Updated
 
-- **`AI/TODO.md`**: When you complete a task, mark it done. When you discover new work, add it. When priorities change, note it. This is the living task tracker.
-- **`documentation/publication/Publication.md`**: When you make a design decision, encounter an interesting problem, or produce a result worth noting, add a brief entry. This collects material for an eventual paper.
+- **`AI/TODO.md`**: When you complete a task, mark it done. When you discover new work, add it. When priorities change, note it. This is the living task tracker. **Update automatically upon task completion** — do not wait to be asked.
+- **`documentation/publication/Publication.md`**: When you make a design decision, encounter an interesting problem, or produce a result worth noting, add a brief entry. This collects material for an eventual paper. **Update automatically upon task completion** — do not wait to be asked.
 
 ### Working Conventions
 
@@ -116,6 +146,7 @@ main() [fitsverify.c]
 
 ### Build & Test
 
+- cmake is located at `/usr/local/cmake/bin/cmake`.
 - The library should build with CMake.
 - Target: CFITSIO 4.x, modern C (C11 or later).
 - The Python package should use `pyproject.toml` and build via standard Python packaging tools.

@@ -17,12 +17,10 @@
 #include <math.h>
 #include <limits.h>
 #include "fitsio.h"
+#include "fitsverify.h"
 
 #define MAXERRORS  200
 #define MAXWRNS   200
-
-/* Forward declaration — full definition in fv_context.h */
-typedef struct fv_context fv_context;
 
 /********************************
 *                               *
@@ -120,6 +118,7 @@ typedef struct {
 } ColName;
 
 int  verify_fits(fv_context *ctx, char *infile, FILE *out);
+int  verify_fits_fptr(fv_context *ctx, fitsfile *infits, FILE *out);
 void leave_early(fv_context *ctx, FILE *out);
 void close_err(fv_context *ctx, FILE *out);
 void init_hdu(fv_context *ctx, fitsfile *infits, FILE *out,
@@ -191,12 +190,12 @@ void update_parfile(fv_context *ctx, int numerr, int numwrn);
 *                               *
 ********************************/
 void print_fmt(fv_context *ctx, FILE *out, char *temp, int nprompt);
-int  wrtout(FILE *out, char *comm);
-int  wrterr(fv_context *ctx, FILE *out, char *comm, int severity);
-int  wrtwrn(fv_context *ctx, FILE *out, char *comm, int heasarc);
-int  wrtferr(fv_context *ctx, FILE *out, char *mess, int *status, int severity);
-int  wrtserr(fv_context *ctx, FILE *out, char *mess, int *status, int severity);
-void wrtsep(FILE *out, char fill, char *title, int nchar);
+int  wrtout(fv_context *ctx, FILE *out, char *comm);
+int  wrterr(fv_context *ctx, FILE *out, char *comm, int severity, int code);
+int  wrtwrn(fv_context *ctx, FILE *out, char *comm, int heasarc, int code);
+int  wrtferr(fv_context *ctx, FILE *out, char *mess, int *status, int severity, int code);
+int  wrtserr(fv_context *ctx, FILE *out, char *mess, int *status, int severity, int code);
+void wrtsep(fv_context *ctx, FILE *out, char fill, char *title, int nchar);
 void num_err_wrn(fv_context *ctx, int *num_err, int *num_wrn);
 void reset_err_wrn(fv_context *ctx);
 int  compkey(const void *key1, const void *key2);

@@ -1,5 +1,6 @@
 #include "fv_internal.h"
 #include "fv_context.h"
+#include "fv_hints.h"
 typedef struct {
    int nnum;
    int ncmp;
@@ -119,7 +120,7 @@ void test_data(fv_context *ctx,
         test_agap(ctx,infits,out,hduptr);     /* test the bytes between the
                                                    ascii table columns. */
         if(ffcdfl(infits, &status)) {
-            wrtferr(ctx,out,"checking data fill: ", &status, 1);
+            wrtferr(ctx,out,"checking data fill: ", &status, 1, FV_ERR_DATA_FILL);
             status = 0;
         }
     }
@@ -133,7 +134,7 @@ void test_data(fv_context *ctx,
     ffgkyjj(infits, "NAXIS2", &naxis2, NULL, &status);
 
     if (naxis2 > 2147483647) {
-       wrtout(out, "Cannot test data in tables with more than 2**31 (2147483647) rows.");
+       wrtout(ctx, out, "Cannot test data in tables with more than 2**31 (2147483647) rows.");
        return;
     }
 
@@ -151,8 +152,8 @@ void test_data(fv_context *ctx,
 	rows_per_loop = 0;
         for (i=0; i< ncols; i++){
             if(fits_get_coltype(infits, i+1, &datatype, NULL, NULL, &status)){
-               sprintf(ctx->errmes,"Column #%d: ",i);
- 	       wrtferr(ctx,out,ctx->errmes, &status,2);
+               snprintf(ctx->errmes, sizeof(ctx->errmes), "Column #%d: ",i);
+ 	       wrtferr(ctx,out,ctx->errmes, &status,2, FV_ERR_CFITSIO);
             }
             if ( datatype != TSTRING ) {
 	           numlist[nnum] = i+1;
@@ -176,8 +177,8 @@ void test_data(fv_context *ctx,
         for (i=0; i< ncols; i++){
             if(fits_get_coltype(infits, i+1, &datatype, &repeat, NULL,
                &status)){
-               sprintf(ctx->errmes,"Column #%d: ",i);
- 	       wrtferr(ctx,out,ctx->errmes, &status,2);
+               snprintf(ctx->errmes, sizeof(ctx->errmes), "Column #%d: ",i);
+ 	       wrtferr(ctx,out,ctx->errmes, &status,2, FV_ERR_CFITSIO);
             }
 
 	    if(datatype < 0) {    /* variable length column */
@@ -255,8 +256,8 @@ void test_data(fv_context *ctx,
     for (i=0; i< nnum; i++){
         j = fits_iter_get_colnum(&(iter_col[i]));
         if(fits_get_coltype(infits, j, &datatype, &repeat, NULL, &status)){
-           sprintf(ctx->errmes,"Column #%d: ",i);
- 	   wrtferr(ctx,out,ctx->errmes, &status,2);
+           snprintf(ctx->errmes, sizeof(ctx->errmes), "Column #%d: ",i);
+ 	   wrtferr(ctx,out,ctx->errmes, &status,2, FV_ERR_CFITSIO);
         }
         usrdata.indatatyp[i] = datatype;
         usrdata.mask[i] = 255;
@@ -271,7 +272,7 @@ void test_data(fv_context *ctx,
     if(niter > 0) {
 	if(fits_iterate_data(niter, iter_col, offset,rows_per_loop, iterdata,
             &usrdata,&status)){
-            wrtserr(ctx,out,"When Reading data, ",&status,2);
+            wrtserr(ctx,out,"When Reading data, ",&status,2, FV_ERR_CFITSIO_STACK);
         }
     }
 
@@ -363,43 +364,91 @@ void test_data(fv_context *ctx,
 
 
     for (jl = 1; jl <= totalrows; jl++) {
+        if (ctx->maxerrors_reached) break;
         for (i = 0; i < ndesc; i++) {
             icol = desclist[i];
+            FV_HINT_SET_COLNUM(ctx, icol);
 
             /* read and check the descriptor length and offset values */
             if(fits_read_descriptll(infits, icol ,jl,&length,
 		   &toffset, &status)){
 
-                sprintf(errtmp,"Row #%ld Col.#%d: ",jl,icol);
-	        wrtferr(ctx,out,errtmp,&status,2);
+                snprintf(errtmp, sizeof(errtmp), "Row #%ld Col.#%d: ",jl,icol);
+	        wrtferr(ctx,out,errtmp,&status,2, FV_ERR_CFITSIO);
             }
             if (!isVarQFormat[i])
             {
                if (!largeVarLengthWarned && length > 2147483647)
                {
                   strcpy(ctx->errmes,"Var row length exceeds maximum 32-bit signed int.  ");
-                  sprintf(errtmp,"First detected for Row #%ld Column #%d",jl,icol);
+                  snprintf(errtmp, sizeof(errtmp), "First detected for Row #%ld Column #%d",jl,icol);
                   strcat(ctx->errmes,errtmp);
-                  wrtwrn(ctx,out,ctx->errmes,0);
+                  wrtwrn(ctx,out,ctx->errmes,0, FV_WARN_VAR_EXCEEDS_32BIT);
                   largeVarLengthWarned = 1;
                }
                if (!largeVarOffsetWarned && toffset > 2147483647)
                {
                   strcpy(ctx->errmes,"Heap offset for var length row exceeds maximum 32-bit signed int.  ");
-                  sprintf(errtmp,"First detected for Row #%ld Column #%d",jl,icol);
+                  snprintf(errtmp, sizeof(errtmp), "First detected for Row #%ld Column #%d",jl,icol);
                   strcat(ctx->errmes,errtmp);
-                  wrtwrn(ctx,out,ctx->errmes,0);
+                  wrtwrn(ctx,out,ctx->errmes,0, FV_WARN_VAR_EXCEEDS_32BIT);
                   largeVarOffsetWarned = 1;
                }
             }
 
 	    if(length > maxlen[i] && maxlen[i] > -1 ) {
-	        sprintf(ctx->errmes, "Descriptor of Column #%d at Row %ld: ",
+	        snprintf(ctx->errmes, sizeof(ctx->errmes), "Descriptor of Column #%d at Row %ld: ",
                      icol, jl);
-                sprintf(errtmp,"nelem(%ld) > maxlen(%ld) given by TFORM%d.",
+                snprintf(errtmp, sizeof(errtmp), "nelem(%ld) > maxlen(%ld) given by TFORM%d.",
                     (long) length,maxlen[i],icol);
                 strcat(ctx->errmes,errtmp);
-                wrterr(ctx,out,ctx->errmes,1);
+                {
+                    char colname[FLEN_VALUE] = "";
+                    char tformval[FLEN_VALUE] = "";
+                    char typechar = '?';
+                    const char *p;
+                    int tmpstat = 0;
+                    snprintf(errtmp, sizeof(errtmp), "TTYPE%d", icol);
+                    fits_read_key_str(infits, errtmp, colname, NULL, &tmpstat);
+                    tmpstat = 0;
+                    snprintf(errtmp, sizeof(errtmp), "TFORM%d", icol);
+                    fits_read_key_str(infits, errtmp, tformval, NULL, &tmpstat);
+                    /* Extract type char: in "1PE(0)", type is 'E' (after P/Q) */
+                    for (p = tformval; *p; p++) {
+                        if (*p == 'P' || *p == 'Q') { typechar = *(p+1); break; }
+                        if (*p == 'p' || *p == 'q') { typechar = *(p+1); break; }
+                    }
+                    if (colname[0]) {
+                        FV_HINT_SET_FIX(ctx,
+                            "Column '%s' (col %d) has TFORM%d = '%s' "
+                            "declaring max %ld elements, but row %ld "
+                            "contains %ld. Change TFORM%d to '1%c%c(%ld)'.",
+                            colname, icol, icol, tformval,
+                            maxlen[i], jl, (long)length,
+                            icol,
+                            isVarQFormat[i] ? 'Q' : 'P', typechar,
+                            (long)length);
+                    } else {
+                        FV_HINT_SET_FIX(ctx,
+                            "Column %d has TFORM%d = '%s' declaring "
+                            "max %ld elements, but row %ld contains %ld. "
+                            "Change TFORM%d to '1%c%c(%ld)'.",
+                            icol, icol, tformval, maxlen[i],
+                            jl, (long)length,
+                            icol,
+                            isVarQFormat[i] ? 'Q' : 'P', typechar,
+                            (long)length);
+                    }
+                    FV_HINT_SET_EXPLAIN(ctx,
+                        "Variable-length array columns use TFORM = "
+                        "'1P<type>(<max>)' where <max> declares the "
+                        "maximum array size. The data in row %ld has %ld "
+                        "elements which exceeds the declared maximum of "
+                        "%ld. Either increase <max> in TFORM%d or the "
+                        "data is corrupt. See FITS Standard Section 7.3.5.",
+                        jl, (long)length, maxlen[i], icol);
+                }
+                wrterr(ctx,out,ctx->errmes,1, FV_ERR_VAR_EXCEEDS_MAXLEN);
             }
 
             if( perbyte[i] < 0)
@@ -408,20 +457,20 @@ void test_data(fv_context *ctx,
                  bytelength = length*perbyte[i];
 
             if(toffset + bytelength > hduptr->pcount ) {
-	        sprintf(ctx->errmes, "Descriptor of Column #%d at Row %ld: ",
+	        snprintf(ctx->errmes, sizeof(ctx->errmes), "Descriptor of Column #%d at Row %ld: ",
                      icol, jl);
-	        sprintf(errtmp,
+	        snprintf(errtmp, sizeof(errtmp),
                     " offset of first element(%ld) + nelem(%ld)",
                      (long) toffset, (long) length);
                 strcat(ctx->errmes,errtmp);
                 if(perbyte[i] < 0)
-	            sprintf(errtmp, "/8 >  total heap area  = %ld.",
+	            snprintf(errtmp, sizeof(errtmp), "/8 >  total heap area  = %ld.",
 		       (long) hduptr->pcount);
                 else
-	            sprintf(errtmp, "*%d >  total heap area  = %ld.",
+	            snprintf(errtmp, sizeof(errtmp), "*%d >  total heap area  = %ld.",
 		       perbyte[i], (long) hduptr->pcount);
                 strcat(ctx->errmes,errtmp);
-                wrterr(ctx,out,ctx->errmes,2);
+                wrterr(ctx,out,ctx->errmes,2, FV_ERR_VAR_EXCEEDS_HEAP);
             }
 
             if(!length) continue;  /* skip the 0 length array */
@@ -450,17 +499,17 @@ void test_data(fv_context *ctx,
             else if(dflag[i] == 0) { /* read String column */
 	        if(fits_read_col(infits, TSTRING, icol, jl, 1,
 		    rlength, NULL, &cdata, &anynul, &status)) {
-                    sprintf(errtmp,"Row #%ld Col.#%d: ",jl,icol);
-	            wrtferr(ctx,out,errtmp,&status,2);
+                    snprintf(errtmp, sizeof(errtmp), "Row #%ld Col.#%d: ",jl,icol);
+	            wrtferr(ctx,out,errtmp,&status,2, FV_ERR_CFITSIO);
                 }
                 else {
                   j = 0;
                   while (cdata[j] != 0) {
 
                     if ((cdata[j] > 126) || (cdata[j] < 32) ) {
-                      sprintf(ctx->errmes,
+                      snprintf(ctx->errmes, sizeof(ctx->errmes),
                       "String in row #%ld, and column #%d contains non-ASCII text.", jl,icol);
-                      wrterr(ctx,out,ctx->errmes,1);
+                      wrterr(ctx,out,ctx->errmes,1, FV_ERR_NONASCII_DATA);
                         strcpy(ctx->errmes,
             "             (This error is reported only once; other rows may have errors).");
                       print_fmt(ctx,out,ctx->errmes,13);
@@ -473,16 +522,16 @@ void test_data(fv_context *ctx,
             else if(dflag[i] == 3) { /* read Logical column */
 	        if(fits_read_col(infits, TLOGICAL, icol, jl, 1,
 		    rlength, &lnull, cdata, &anynul, &status)) {
-                    sprintf(errtmp,"Row #%ld Col.#%d: ",jl,icol);
-	            wrtferr(ctx,out,errtmp,&status,2);
+                    snprintf(errtmp, sizeof(errtmp), "Row #%ld Col.#%d: ",jl,icol);
+	            wrtferr(ctx,out,errtmp,&status,2, FV_ERR_CFITSIO);
                 }
                 else {
 		  for (k = 0; k < rlength; k++) {
                     if (cdata[k] > 2) {
-                      sprintf(ctx->errmes,
+                      snprintf(ctx->errmes, sizeof(ctx->errmes),
                       "Logical value in row #%ld, column #%d not equal to 'T', 'F', or 0",
                          jl, icol);
-                       wrterr(ctx,out,ctx->errmes,1);
+                       wrterr(ctx,out,ctx->errmes,1, FV_ERR_BAD_LOGICAL_DATA);
                        strcpy(ctx->errmes,
            "             (This error is reported only once; other rows may have errors).");
                        print_fmt(ctx,out,ctx->errmes,13);
@@ -594,20 +643,21 @@ data_end:
         usrpt->find_badbit = 0;
 
         /* check for the bit jurisfication  */
+        FV_HINT_SET_COLNUM(usrpt->ctx, fits_iter_get_colnum(&(iter_col[i])));
         if(!usrpt->find_badbit && usrpt->indatatyp[i] == TBIT ) {
             for (k = 0; k < nrows; k++) {
                j = (k+1)*usrpt->repeat[i];
                bdata = (unsigned char)data[j];
                if( bdata & usrpt->mask[i] ) {
-                  sprintf(usrpt->ctx->errmes,
+                  snprintf(usrpt->ctx->errmes, sizeof(usrpt->ctx->errmes),
                     "Row #%ld, and Column #%d: X vector ", firstn+k,
                       fits_iter_get_colnum(&(iter_col[i])));
                   for (l = 1; l<= usrpt->repeat[i]; l++) {
-                     sprintf(usrpt->ctx->comm, "0x%02x ", (unsigned char) data[k*usrpt->repeat[i]+l]);
+                     snprintf(usrpt->ctx->comm, sizeof(usrpt->ctx->comm), "0x%02x ", (unsigned char) data[k*usrpt->repeat[i]+l]);
                      strcat(usrpt->ctx->errmes,usrpt->ctx->comm);
                   }
                   strcat(usrpt->ctx->errmes,"is not left justified.");
-                  wrterr(usrpt->ctx,usrpt->out,usrpt->ctx->errmes,2);
+                  wrterr(usrpt->ctx,usrpt->out,usrpt->ctx->errmes,2, FV_ERR_BIT_NOT_JUSTIFIED);
                   strcpy(usrpt->ctx->errmes,
           "             (Other rows may have errors).");
                   print_fmt(usrpt->ctx,usrpt->out,usrpt->ctx->errmes,13);
@@ -620,6 +670,7 @@ data_end:
 
     /* deal with character and logical columns */
     for (i = nnum + ncmp; i < nnum + ncmp + ntxt; i++) {
+        FV_HINT_SET_COLNUM(usrpt->ctx, fits_iter_get_colnum(&(iter_col[i])));
         if(usrpt->datatype[i] == TSTRING ) {	/* character */
             nelem = nrows;
 	    if(nelem == 0) continue;
@@ -634,10 +685,10 @@ data_end:
                 while (ucdata[j] != 0) {
 
                   if ((ucdata[j] > 126) || (ucdata[j] < 32)) {
-                    sprintf(usrpt->ctx->errmes,
+                    snprintf(usrpt->ctx->errmes, sizeof(usrpt->ctx->errmes),
                     "String in row #%ld, column #%d contains non-ASCII text.", firstn+k,
                       fits_iter_get_colnum(&(iter_col[i])));
-                      wrterr(usrpt->ctx,usrpt->out,usrpt->ctx->errmes,1);
+                      wrterr(usrpt->ctx,usrpt->out,usrpt->ctx->errmes,1, FV_ERR_NONASCII_DATA);
                       strcpy(usrpt->ctx->errmes,
           "             (Other rows may have errors).");
                       print_fmt(usrpt->ctx,usrpt->out,usrpt->ctx->errmes,13);
@@ -660,11 +711,11 @@ data_end:
             if (!usrpt->find_badlog) {
                 for(j = 1; j <= nrows * usrpt->repeat[i]; j++) {
                   if (ldata[j] > 2) {
-                    sprintf(usrpt->ctx->errmes,
+                    snprintf(usrpt->ctx->errmes, sizeof(usrpt->ctx->errmes),
                     "Logical value in row #%ld, column #%d not equal to 'T', 'F', or 0",
                        (firstn+j - 2)/usrpt->repeat[i] +1,
                        fits_iter_get_colnum(&(iter_col[i])));
-                       wrterr(usrpt->ctx,usrpt->out,usrpt->ctx->errmes,1);
+                       wrterr(usrpt->ctx,usrpt->out,usrpt->ctx->errmes,1, FV_ERR_BAD_LOGICAL_DATA);
                        strcpy(usrpt->ctx->errmes,
          "             (Other rows may have similar errors).");
                        print_fmt(usrpt->ctx,usrpt->out,usrpt->ctx->errmes,13);
@@ -677,6 +728,7 @@ data_end:
     }
 
     for (i = nnum + ncmp +ntxt; i < nnum + ncmp + ntxt + nfloat; i++) {
+            FV_HINT_SET_COLNUM(usrpt->ctx, fits_iter_get_colnum(&(iter_col[i])));
             nelem = nrows;
 	    if(nelem == 0) continue;
 	    cdata = (char **) fits_iter_get_array(&(iter_col[i]));
@@ -694,10 +746,10 @@ data_end:
 
                   if (strlen(floatvalue)) {  /* ignore completely blank fields */
 
-                    sprintf(usrpt->ctx->errmes,
+                    snprintf(usrpt->ctx->errmes, sizeof(usrpt->ctx->errmes),
                      "Number in row #%ld, column #%d has no decimal point:", firstn+k,
                      fits_iter_get_colnum(&(iter_col[i])));
-                     wrterr(usrpt->ctx,usrpt->out,usrpt->ctx->errmes,1);
+                     wrterr(usrpt->ctx,usrpt->out,usrpt->ctx->errmes,1, FV_ERR_NO_DECIMAL);
                      strcpy(usrpt->ctx->errmes, floatvalue);
                      strcat(usrpt->ctx->errmes,
                   "  (Other rows may have similar errors).");
@@ -724,10 +776,10 @@ data_end:
 		    }
 
                     if (strchr(floatvalue, ' ') ) {
-                      sprintf(usrpt->ctx->errmes,
+                      snprintf(usrpt->ctx->errmes, sizeof(usrpt->ctx->errmes),
                        "Number in row #%ld, column #%d has embedded space:", firstn+k,
                          fits_iter_get_colnum(&(iter_col[i])));
-                         wrterr(usrpt->ctx,usrpt->out,usrpt->ctx->errmes,1);
+                         wrterr(usrpt->ctx,usrpt->out,usrpt->ctx->errmes,1, FV_ERR_EMBEDDED_SPACE);
                          strcpy(usrpt->ctx->errmes, floatvalue);
                          strcat(usrpt->ctx->errmes,
                       "  (Other rows may have similar errors).");
@@ -798,11 +850,11 @@ void test_agap(fv_context *ctx,
     temp = (int*)malloc(rowlen * sizeof(int));
     for (m = 0; m<rowlen; m++ ) temp[m]=0;
     for (k = 1; k<=ncols; k++ ) {
-	sprintf(keyname, "TFORM%d",k);
+	snprintf(keyname, sizeof(keyname), "TFORM%d",k);
 	fits_read_key_str(infits, keyname, tform, comment, &status);
 	if (fits_ascii_tform(tform, &typecode, &width, &decimals, &status))
-	    wrtferr(ctx,out,"",&status,1);
-	sprintf(keyname, "TBCOL%d",k);
+	    wrtferr(ctx,out,"",&status,1, FV_ERR_CFITSIO);
+	snprintf(keyname, sizeof(keyname), "TBCOL%d",k);
 	fits_read_key_lng(infits, keyname, &tbcol, comment, &status);
 	for (t = tbcol; t < tbcol+width; t++) temp[t-1]=1;
     }
@@ -817,32 +869,32 @@ void test_agap(fv_context *ctx,
         p = data;
         if(fits_read_tblbytes(infits,firstrow,1, rowlen*ntodo,
 	    data, &status)){
-	    wrtferr(ctx,out,"",&status,1);
+	    wrtferr(ctx,out,"",&status,1, FV_ERR_CFITSIO);
         }
         for (j = 0; j<rowlen*ntodo; j++ ) {
             if(!isascii(*p))  {
 	        if(!nerr) {
 #if (USE_LL_SUFFIX == 1)
-		     sprintf(ctx->errmes,
+		     snprintf(ctx->errmes, sizeof(ctx->errmes),
 			"row %lld contains non-ASCII characters.", j/rowlen+1);
 #else
-		     sprintf(ctx->errmes,
+		     snprintf(ctx->errmes, sizeof(ctx->errmes),
 			"row %ld contains non-ASCII characters.", j/rowlen+1);
 #endif
-                     wrterr(ctx,out,ctx->errmes,1);
+                     wrterr(ctx,out,ctx->errmes,1, FV_ERR_NONASCII_TABLE);
                 }
                 nerr++;
             } else if(isascii(*p) && !isprint(*p))  {
 	        if(temp[j%rowlen]) {
 	             if(!nerr) {
 #if (USE_LL_SUFFIX == 1)
-		          sprintf(ctx->errmes,
+		          snprintf(ctx->errmes, sizeof(ctx->errmes),
 			     "row %lld data contains non-ASCII-text characters.", j/rowlen+1);
 #else
-		          sprintf(ctx->errmes,
+		          snprintf(ctx->errmes, sizeof(ctx->errmes),
 			     "row %ld data contains non-ASCII-text characters.", j/rowlen+1);
 #endif
-                          wrterr(ctx,out,ctx->errmes,1);
+                          wrterr(ctx,out,ctx->errmes,1, FV_ERR_NONASCII_TABLE);
                      }
                      nerr++;
                 }
@@ -853,9 +905,9 @@ void test_agap(fv_context *ctx,
 	i -=ntodo;
     }
     if(nerr) {
-	sprintf(ctx->errmes,
+	snprintf(ctx->errmes, sizeof(ctx->errmes),
 	    "This ASCII table contains %ld non-ASCII-text characters",nerr);
-        wrterr(ctx,out,ctx->errmes,1);
+        wrterr(ctx,out,ctx->errmes,1, FV_ERR_NONASCII_TABLE);
     }
     free(data);
     free(temp);
@@ -881,21 +933,21 @@ void test_checksum(fv_context *ctx,
 
     if (fits_verify_chksum(infits, &dataok, &hduok, &status))
     {
-        wrtferr(ctx,out,"verifying checksums: ",&status,2);
+        wrtferr(ctx,out,"verifying checksums: ",&status,2, FV_ERR_CFITSIO);
         return;
     }
 
     if(dataok == -1)
 	wrtwrn(ctx,out,
-        "Data checksum is not consistent with  the DATASUM keyword",0);
+        "Data checksum is not consistent with  the DATASUM keyword",0, FV_WARN_BAD_CHECKSUM);
 
     if(hduok == -1 )  {
 	if(dataok == 1) {
 	   wrtwrn(ctx,out,
-  "Invalid CHECKSUM means header has been modified. (DATASUM is OK) ",0);
+  "Invalid CHECKSUM means header has been modified. (DATASUM is OK) ",0, FV_WARN_BAD_CHECKSUM);
         }
 	else {
-	   wrtwrn(ctx,out, "HDU checksum is not in agreement with CHECKSUM.",0);
+	   wrtwrn(ctx,out, "HDU checksum is not in agreement with CHECKSUM.",0, FV_WARN_BAD_CHECKSUM);
         }
     }
     return;

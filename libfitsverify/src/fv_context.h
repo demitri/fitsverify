@@ -7,7 +7,6 @@
 #ifndef FV_CONTEXT_H
 #define FV_CONTEXT_H
 
-#include <setjmp.h>
 #include "fitsio.h"
 #include "fv_internal.h"
 
@@ -22,6 +21,8 @@ struct fv_context {
     int  heasarc_conv;     /* check HEASARC conventions                   */
     int  testhierarch;     /* test ESO HIERARCH keywords                  */
     int  err_report;       /* 0 = all, 1 = errors only, 2 = severe only  */
+    int  fix_hints;        /* attach fix hints to callback messages       */
+    int  explain;          /* attach explanations to callback messages    */
     int  totalhdu;         /* total number of HDUs in current file        */
 
     /* ---- session accumulators (former globals from ftverify.c) ------- */
@@ -55,6 +56,13 @@ struct fv_context {
     int   curhdu;          /* current HDU index                          */
     int   curtype;         /* current HDU type                           */
 
+    /* ---- hint context for context-aware hints ------------------------ */
+    char  hint_keyword[FLEN_KEYWORD]; /* keyword name for hints          */
+    int   hint_colnum;                /* column number (1-based); 0=none */
+    int   hint_callsite;              /* 1 = call site wrote hint_fix_buf */
+    char  hint_fix_buf[1024];         /* buffer for generated fix_hint   */
+    char  hint_explain_buf[1024];     /* buffer for generated explain    */
+
     /* ---- print_fmt state (former statics in print_fmt) -------------- */
     char  cont_fmt[80];
     int   save_nprompt;
@@ -63,9 +71,12 @@ struct fv_context {
     char  hdutitle[64];
     int   oldhdu;
 
-    /* ---- abort / longjmp state -------------------------------------- */
-    jmp_buf abort_jmp;
-    int     abort_set;
+    /* ---- abort state ------------------------------------------------ */
+    int     maxerrors_reached;  /* set when nerrs > MAXERRORS           */
+
+    /* ---- output callback (NULL = use FILE* streams) ----------------- */
+    fv_output_fn output_fn;
+    void        *output_udata;
 };
 
 #endif /* FV_CONTEXT_H */

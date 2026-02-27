@@ -39,6 +39,8 @@ ffi.cdef("""
         fv_error_code   code;
         int             hdu_num;
         const char     *text;
+        const char     *fix_hint;
+        const char     *explain;
     } fv_message;
 
     /* callback type */
@@ -53,7 +55,9 @@ ffi.cdef("""
         FV_OPT_TESTFILL     = 4,
         FV_OPT_HEASARC_CONV = 5,
         FV_OPT_TESTHIERARCH = 6,
-        FV_OPT_ERR_REPORT   = 7
+        FV_OPT_ERR_REPORT   = 7,
+        FV_OPT_FIX_HINTS    = 8,
+        FV_OPT_EXPLAIN       = 9
     } fv_option;
 
     /* per-file result */
@@ -108,6 +112,7 @@ _rel_src = os.path.relpath(_lib_src, _pkg_root)
 
 _c_sources = [
     os.path.join(_rel_src, 'fv_api.c'),
+    os.path.join(_rel_src, 'fv_hints.c'),
     os.path.join(_rel_src, 'fvrf_misc.c'),
     os.path.join(_rel_src, 'fvrf_key.c'),
     os.path.join(_rel_src, 'fvrf_file.c'),
@@ -187,7 +192,7 @@ ffi.set_source(
     include_dirs=[_lib_inc, _lib_src] + cfitsio_inc,
     library_dirs=cfitsio_lib,
     libraries=cfitsio_libs + ['m'],
-    define_macros=[('STANDALONE', '1'), ('ERR2OUT', '1')],
+    define_macros=[],
 )
 
 if __name__ == '__main__':

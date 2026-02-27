@@ -20,6 +20,7 @@ module). For true parallelism, use multiprocessing.
 from fitsverify._core import (
     verify,
     verify_all,
+    verify_parallel,
     VerificationResult,
     Issue,
     Severity,
@@ -29,6 +30,7 @@ from fitsverify._core import (
 __all__ = [
     'verify',
     'verify_all',
+    'verify_parallel',
     'VerificationResult',
     'Issue',
     'Severity',

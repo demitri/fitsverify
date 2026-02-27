@@ -8,9 +8,9 @@
 *      num_err_wrn: Return the number of errors and warnings.
 *
 *******************************************************************************/
-#include <setjmp.h>
 #include "fv_internal.h"
 #include "fv_context.h"
+#include "fv_hints.h"
 
 void num_err_wrn(fv_context *ctx, int *num_err, int *num_wrn)
 {
@@ -26,28 +26,88 @@ void reset_err_wrn(fv_context *ctx)
     return;
 }
 
-int wrtout(FILE *out, char *mess)
+static void dispatch_msg(fv_context *ctx, fv_msg_severity severity,
+                         int code, const char *text)
 {
+    fv_message msg;
+    msg.severity = severity;
+    msg.code     = (fv_error_code)code;
+    msg.hdu_num  = ctx->curhdu;
+    msg.text     = text;
+    msg.fix_hint = NULL;
+    msg.explain  = NULL;
+
+    if ((ctx->fix_hints || ctx->explain) && code != FV_OK) {
+        const fv_hint *h = fv_generate_hint(ctx, (fv_error_code)code);
+        if (h) {
+            if (ctx->fix_hints) msg.fix_hint = h->fix_hint;
+            if (ctx->explain)   msg.explain  = h->explain;
+        }
+    }
+
+    ctx->output_fn(&msg, ctx->output_udata);
+    FV_HINT_CLEAR(ctx);
+}
+
+/* Print hint/explain text after an error/warning in FILE* mode */
+static void print_hints_file(fv_context *ctx, FILE *out, int code)
+{
+    const fv_hint *h;
+    if (!ctx->fix_hints && !ctx->explain) { FV_HINT_CLEAR(ctx); return; }
+    if (code == FV_OK) { FV_HINT_CLEAR(ctx); return; }
+    h = fv_generate_hint(ctx, (fv_error_code)code);
+    if (!h) { FV_HINT_CLEAR(ctx); return; }
+    if (ctx->fix_hints && h->fix_hint) {
+        if (out && out != stdout && out != stderr)
+            fprintf(out, "    Fix: %s\n", h->fix_hint);
+        fprintf(stderr, "    Fix: %s\n", h->fix_hint);
+    }
+    if (ctx->explain && h->explain) {
+        if (out && out != stdout && out != stderr)
+            fprintf(out, "    Explanation: %s\n", h->explain);
+        fprintf(stderr, "    Explanation: %s\n", h->explain);
+    }
+    FV_HINT_CLEAR(ctx);
+}
+
+int wrtout(fv_context *ctx, FILE *out, char *mess)
+{
+    if(ctx && ctx->output_fn) {
+        dispatch_msg(ctx, FV_MSG_INFO, FV_OK, mess);
+        return 0;
+    }
     if(out != NULL )fprintf(out,"%s\n",mess);
     if(out == stdout) fflush(stdout);
     return 0;
 }
 
-int wrtwrn(fv_context *ctx, FILE *out, char *mess, int isheasarc)
+int wrtwrn(fv_context *ctx, FILE *out, char *mess, int isheasarc, int code)
 {
-    if(ctx->err_report) return 0;
-    if(!ctx->heasarc_conv && isheasarc) return 0;
+    if(ctx->maxerrors_reached) { FV_HINT_CLEAR(ctx); return 0; }
+    if(ctx->err_report) { FV_HINT_CLEAR(ctx); return 0; }
+    if(!ctx->heasarc_conv && isheasarc) { FV_HINT_CLEAR(ctx); return 0; }
     ctx->nwrns++;
     strcpy(ctx->misc_temp,"*** Warning: ");
     strcat(ctx->misc_temp,mess);
     if(isheasarc) strcat(ctx->misc_temp," (HEASARC Convention)");
+    if(ctx->output_fn) {
+        dispatch_msg(ctx, FV_MSG_WARNING, code, ctx->misc_temp);
+        return ctx->nwrns;
+    }
     print_fmt(ctx,out,ctx->misc_temp,13);
+    print_hints_file(ctx, out, code);
     return ctx->nwrns;
 }
 
-int wrterr(fv_context *ctx, FILE *out, char *mess, int severity )
+int wrterr(fv_context *ctx, FILE *out, char *mess, int severity, int code)
 {
+    if(ctx->maxerrors_reached) {
+        FV_HINT_CLEAR(ctx);
+        fits_clear_errmsg();
+        return ctx->nerrs;
+    }
     if(severity < ctx->err_report) {
+        FV_HINT_CLEAR(ctx);
         fits_clear_errmsg();
         return 0;
     }
@@ -55,34 +115,43 @@ int wrterr(fv_context *ctx, FILE *out, char *mess, int severity )
 
     strcpy(ctx->misc_temp,"*** Error:   ");
     strcat(ctx->misc_temp,mess);
+    if(ctx->output_fn) {
+        dispatch_msg(ctx, severity >= 2 ? FV_MSG_SEVERE : FV_MSG_ERROR,
+                     code, ctx->misc_temp);
+        if(ctx->nerrs > MAXERRORS) {
+            dispatch_msg(ctx, FV_MSG_SEVERE, FV_ERR_TOO_MANY,
+                         "??? Too many Errors! I give up...");
+            ctx->maxerrors_reached = 1;
+        }
+        fits_clear_errmsg();
+        return ctx->nerrs;
+    }
     if(out != NULL) {
          if ((out!=stdout) && (out!=stderr)) print_fmt(ctx,out,ctx->misc_temp,13);
-#ifdef ERR2OUT
-         print_fmt(ctx,stdout,ctx->misc_temp,13);
-#else
          print_fmt(ctx,stderr,ctx->misc_temp,13);
-#endif
     }
+    print_hints_file(ctx, out, code);
 
     if(ctx->nerrs > MAXERRORS ) {
-#ifdef ERR2OUT
-	 fprintf(stdout,"??? Too many Errors! I give up...\n");
-#else
 	 fprintf(stderr,"??? Too many Errors! I give up...\n");
-#endif
-         close_report(ctx, out);
-         if (ctx->abort_set)
-             longjmp(ctx->abort_jmp, 1);
+         ctx->maxerrors_reached = 1;
     }
     fits_clear_errmsg();
     return ctx->nerrs;
 }
 
-int wrtferr(fv_context *ctx, FILE *out, char* mess, int *status, int severity)
+int wrtferr(fv_context *ctx, FILE *out, char* mess, int *status, int severity, int code)
 {
     char ttemp[255];
 
+    if(ctx->maxerrors_reached) {
+        FV_HINT_CLEAR(ctx);
+        *status = 0;
+        fits_clear_errmsg();
+        return ctx->nerrs;
+    }
     if(severity < ctx->err_report) {
+        FV_HINT_CLEAR(ctx);
         fits_clear_errmsg();
         return 0;
     }
@@ -92,38 +161,48 @@ int wrtferr(fv_context *ctx, FILE *out, char* mess, int *status, int severity)
     strcat(ctx->misc_temp,mess);
     fits_get_errstatus(*status, ttemp);
     strcat(ctx->misc_temp,ttemp);
+    if(ctx->output_fn) {
+        dispatch_msg(ctx, severity >= 2 ? FV_MSG_SEVERE : FV_MSG_ERROR,
+                     code, ctx->misc_temp);
+        *status = 0;
+        fits_clear_errmsg();
+        if(ctx->nerrs > MAXERRORS) {
+            dispatch_msg(ctx, FV_MSG_SEVERE, FV_ERR_TOO_MANY,
+                         "??? Too many Errors! I give up...");
+            ctx->maxerrors_reached = 1;
+        }
+        return ctx->nerrs;
+    }
     if(out != NULL ) {
         if ((out!=stdout) && (out!=stderr)) print_fmt(ctx,out,ctx->misc_temp,13);
-#ifdef ERR2OUT
-         print_fmt(ctx,stdout,ctx->misc_temp,13);
-#else
          print_fmt(ctx,stderr,ctx->misc_temp,13);
-#endif
     }
+    print_hints_file(ctx, out, code);
 
     *status = 0;
     fits_clear_errmsg();
     if(ctx->nerrs > MAXERRORS ) {
-#ifdef ERR2OUT
-	 fprintf(stdout,"??? Too many Errors! I give up...\n");
-#else
 	 fprintf(stderr,"??? Too many Errors! I give up...\n");
-#endif
-         close_report(ctx, out);
-         if (ctx->abort_set)
-             longjmp(ctx->abort_jmp, 1);
+         ctx->maxerrors_reached = 1;
     }
     return ctx->nerrs;
 }
 
-int wrtserr(fv_context *ctx, FILE *out, char* mess, int *status, int severity)
+int wrtserr(fv_context *ctx, FILE *out, char* mess, int *status, int severity, int code)
 {
     char* errfmt = "             %.67s\n";
     int i;
     char tmp[20][80];
     int nstack = 0;
 
+    if(ctx->maxerrors_reached) {
+        FV_HINT_CLEAR(ctx);
+        *status = 0;
+        fits_clear_errmsg();
+        return ctx->nerrs;
+    }
     if(severity < ctx->err_report) {
+        FV_HINT_CLEAR(ctx);
         fits_clear_errmsg();
         return 0;
     }
@@ -139,31 +218,36 @@ int wrtserr(fv_context *ctx, FILE *out, char* mess, int *status, int severity)
         nstack++;
     }
 
+    if(ctx->output_fn) {
+        dispatch_msg(ctx, severity >= 2 ? FV_MSG_SEVERE : FV_MSG_ERROR,
+                     code, ctx->misc_temp);
+        for(i=0; i<nstack; i++)
+            dispatch_msg(ctx, FV_MSG_INFO, FV_OK, tmp[i]);
+        *status = 0;
+        fits_clear_errmsg();
+        if(ctx->nerrs > MAXERRORS) {
+            dispatch_msg(ctx, FV_MSG_SEVERE, FV_ERR_TOO_MANY,
+                         "??? Too many Errors! I give up...");
+            ctx->maxerrors_reached = 1;
+        }
+        return ctx->nerrs;
+    }
+
     if(out !=NULL) {
         if ((out!=stdout) && (out!=stderr)) {
            print_fmt(ctx,out,ctx->misc_temp,13);
            for(i=0; i<=nstack; i++) fprintf(out,errfmt,tmp[i]);
          }
-#ifdef ERR2OUT
-           print_fmt(ctx,stdout,ctx->misc_temp,13);
-           for(i=0; i<=nstack; i++) fprintf(stdout,errfmt,tmp[i]);
-#else
            print_fmt(ctx,stderr,ctx->misc_temp,13);
            for(i=0; i<=nstack; i++) fprintf(stderr,errfmt,tmp[i]);
-#endif
     }
+    print_hints_file(ctx, out, code);
 
     *status = 0;
     fits_clear_errmsg();
     if(ctx->nerrs > MAXERRORS ) {
-#ifdef ERR2OUT
-	 fprintf(stdout,"??? Too many Errors! I give up...\n");
-#else
 	 fprintf(stderr,"??? Too many Errors! I give up...\n");
-#endif
-         close_report(ctx, out);
-         if (ctx->abort_set)
-             longjmp(ctx->abort_jmp, 1);
+         ctx->maxerrors_reached = 1;
     }
     return ctx->nerrs;
 }
@@ -175,9 +259,15 @@ void print_fmt(fv_context *ctx, FILE *out, char *temp, int nprompt)
     int clen;
     char tmp[81];
 
+    if(ctx && ctx->output_fn) {
+        dispatch_msg(ctx, FV_MSG_INFO, FV_OK, temp);
+        return;
+    }
+
     if (out == NULL) return;
 
     if(nprompt != ctx->save_nprompt) {
+        if (nprompt > 70) nprompt = 70;  /* cap to prevent overflow */
         for (i = 0; i < nprompt; i++) ctx->cont_fmt[i] = ' ';
         ctx->cont_fmt[nprompt] = '\0';
         strcat(ctx->cont_fmt,"%.67s\n");
@@ -237,7 +327,7 @@ void print_fmt(fv_context *ctx, FILE *out, char *temp, int nprompt)
     return;
 }
 
-void wrtsep(FILE *out,char fill, char *title, int nchar)
+void wrtsep(fv_context *ctx, FILE *out, char fill, char *title, int nchar)
 {
     int ntitle;
     char *line;
@@ -262,6 +352,11 @@ void wrtsep(FILE *out,char fill, char *title, int nchar)
 	p += ntitle;
         for( i = first_end + ntitle; i < nchar; i++) {*p = fill; p++;}
 	*p = '\0';
+    }
+    if(ctx && ctx->output_fn) {
+        dispatch_msg(ctx, FV_MSG_INFO, FV_OK, line);
+        free(line);
+        return;
     }
     if(out != NULL )fprintf(out,"%s\n",line);
     if(out == stdout )fflush(out);

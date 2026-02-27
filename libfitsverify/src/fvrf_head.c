@@ -1,15 +1,293 @@
-#include <setjmp.h>
 #include "fv_internal.h"
 #include "fv_context.h"
+#include "fv_hints.h"
 
-/* 
-the following are only needed if one calls wcslib 
+/*
+the following are only needed if one calls wcslib
 #include <wcslib/wcshdr.h>
 #include <wcslib/wcsfix.h>
 #include <wcslib/wcs.h>
 #include <wcslib/getwcstab.h>
 */
 
+/* ---- TDISP mismatch hint helpers ---------------------------------------- */
+
+/* Return suggested TDISPn format description based on the TFORM type letter.
+   Skips leading repeat count digits in the TFORM string. */
+static const char *tdisp_suggestion(const char *tform)
+{
+    const char *p = tform;
+    while (*p >= '0' && *p <= '9') p++;
+    switch (*p) {
+        case 'A': return "Aw (character)";
+        case 'L': return "Lw (logical)";
+        case 'B': case 'I': case 'J': case 'K': case 'X':
+            return "Iw, Bw, Ow, or Zw (integer)";
+        case 'E': case 'F': case 'D': case 'C': case 'M':
+            return "Fw.d, Ew.dEe, Dw.dEe, or Gw.dEe (numeric)";
+        default: return "a format matching the column datatype";
+    }
+}
+
+/* Map TFORM type character to a human-readable name. */
+static const char *tform_type_name(char c)
+{
+    switch (c) {
+        case 'A': return "character";
+        case 'L': return "logical";
+        case 'B': return "8-bit integer";
+        case 'I': return "16-bit integer";
+        case 'J': return "32-bit integer";
+        case 'K': return "64-bit integer";
+        case 'E': case 'F': return "single-precision float";
+        case 'D': return "double-precision float";
+        case 'C': return "single complex";
+        case 'M': return "double complex";
+        case 'X': return "bit";
+        default: return "unknown";
+    }
+}
+
+/* Map TDISP format character to a human-readable display format name. */
+static const char *tdisp_format_name(char c)
+{
+    switch (c) {
+        case 'A': return "character";
+        case 'L': return "logical";
+        case 'I': case 'B': case 'O': case 'Z': return "integer";
+        case 'F': return "fixed-point";
+        case 'E': case 'D': return "scientific-notation";
+        case 'G': return "general numeric";
+        default: return "unknown";
+    }
+}
+
+/* Extract the character width from a TFORM like '10A', 'A10', or 'A'. */
+static int tform_char_width(const char *tform)
+{
+    const char *p = tform;
+    long n = 0;
+    if (*p >= '0' && *p <= '9') {
+        n = strtol(p, NULL, 10);
+    } else if (*p == 'A' || *p == 'a') {
+        p++;
+        if (*p >= '0' && *p <= '9')
+            n = strtol(p, NULL, 10);
+    }
+    return n > 0 ? (int)n : 1;
+}
+
+/* Return 1 if string looks like a logical value. */
+static int looks_logical(const char *s)
+{
+    if (!s || !*s) return 0;
+    while (*s == ' ') s++;
+    /* Single char: T or F */
+    if ((*s == 'T' || *s == 'F') && (s[1] == '\0' || s[1] == ' '))
+        return 1;
+    /* Trim trailing spaces for comparison */
+    char buf[16];
+    int i = 0;
+    while (*s && *s != ' ' && i < 15) buf[i++] = *s++;
+    buf[i] = '\0';
+    if (!strcasecmp(buf, "TRUE") || !strcasecmp(buf, "FALSE") ||
+        !strcasecmp(buf, "YES")  || !strcasecmp(buf, "NO") ||
+        !strcmp(buf, "1")        || !strcmp(buf, "0"))
+        return 1;
+    return 0;
+}
+
+/* Return 1 if string looks like an integer. */
+static int looks_integer(const char *s)
+{
+    if (!s || !*s) return 0;
+    while (*s == ' ') s++;
+    if (*s == '+' || *s == '-') s++;
+    if (!(*s >= '0' && *s <= '9')) return 0;
+    while (*s >= '0' && *s <= '9') s++;
+    while (*s == ' ') s++;
+    return *s == '\0';
+}
+
+/* Return 1 if string looks like a floating-point number. */
+static int looks_numeric(const char *s)
+{
+    if (!s || !*s) return 0;
+    while (*s == ' ') s++;
+    if (*s == '+' || *s == '-') s++;
+    int has_digit = 0;
+    while (*s >= '0' && *s <= '9') { s++; has_digit = 1; }
+    if (*s == '.') {
+        s++;
+        while (*s >= '0' && *s <= '9') { s++; has_digit = 1; }
+    }
+    if (!has_digit) return 0;
+    if (*s == 'E' || *s == 'e' || *s == 'D' || *s == 'd') {
+        s++;
+        if (*s == '+' || *s == '-') s++;
+        while (*s >= '0' && *s <= '9') s++;
+    }
+    while (*s == ' ') s++;
+    return *s == '\0';
+}
+
+/* Generate mismatch-specific fix and explain hints for TDISP errors.
+   Reads the first data row (when hints are enabled) to confirm the
+   likely cause and provide a concrete example. */
+static void tdisp_mismatch_hints(fv_context *ctx, fitsfile *infits, int col,
+                                  const char *tdisp_val, const char *tform,
+                                  const char *kw_name)
+{
+    char tdisp_fmt = tdisp_val[0];
+
+    /* Parse the TFORM type letter (skip repeat count) */
+    const char *tp = tform;
+    while (*tp >= '0' && *tp <= '9') tp++;
+    char tform_char = *tp;
+
+    /* Try to read a sample value from the first row (character columns only) */
+    char sample[80] = "";
+    int have_sample = 0;
+    if (tform_char == 'A' && (ctx->fix_hints || ctx->explain)) {
+        long nrows = 0;
+        int st = 0;
+        fits_get_num_rows(infits, &nrows, &st);
+        if (nrows > 0 && st == 0) {
+            char *ptrs[1] = { sample };
+            int anynul = 0;
+            st = 0;
+            fits_read_col_str(infits, col, 1, 1, 1, "", ptrs, &anynul, &st);
+            if (st == 0 && sample[0] != '\0' && !anynul)
+                have_sample = 1;
+        }
+    }
+
+    if (tform_char == 'A') {
+        /* Character column with non-character display format.
+           Most likely: the data is really of the display type, stored as text.
+           Read the first row to confirm. */
+        const char *valtype;
+        const char *suggested_tform;
+        int confirmed = 0;
+
+        switch (tdisp_fmt) {
+            case 'L':
+                valtype = "logical";
+                suggested_tform = "1L";
+                if (have_sample) confirmed = looks_logical(sample);
+                break;
+            case 'I': case 'B': case 'O': case 'Z':
+                valtype = "integer";
+                suggested_tform = "1J";
+                if (have_sample) confirmed = looks_integer(sample);
+                break;
+            case 'F': case 'E': case 'D': case 'G':
+                valtype = "numeric";
+                suggested_tform = "1D";
+                if (have_sample) confirmed = looks_numeric(sample);
+                break;
+            default:
+                valtype = NULL;
+                suggested_tform = NULL;
+                break;
+        }
+
+        if (!valtype) {
+            /* Shouldn't happen, but fallback */
+            FV_HINT_SET_FIX(ctx,
+                "Column %d has TFORM '%s'; use %s format for %s.",
+                col, tform, tdisp_suggestion(tform), kw_name);
+            return;
+        }
+
+        int aw = tform_char_width(tform);
+
+        if (have_sample && confirmed) {
+            /* Sample confirms data matches the display type */
+            FV_HINT_SET_FIX(ctx,
+                "Row 1 contains '%s'. Change TFORM%d to '%s' to "
+                "declare the column as %s.",
+                sample, col, suggested_tform, valtype);
+            FV_HINT_SET_EXPLAIN(ctx,
+                "Column %d is declared as character data (TFORM '%s') "
+                "but has a %s display format ('%s'). Row 1 contains "
+                "'%s', confirming this holds %s values stored as text. "
+                "See FITS Standard Section 7.3.3.",
+                col, tform, tdisp_format_name(tdisp_fmt), tdisp_val,
+                sample, valtype);
+        } else if (have_sample && !confirmed) {
+            /* Sample doesn't match the display type — TDISP is likely wrong */
+            FV_HINT_SET_FIX(ctx,
+                "Row 1 contains '%s'. Change %s to 'A%d' "
+                "for character display.",
+                sample, kw_name, aw);
+            FV_HINT_SET_EXPLAIN(ctx,
+                "Column %d is declared as character data (TFORM '%s') "
+                "but has a %s display format ('%s'). Row 1 contains "
+                "'%s', which is not a %s value, so the display format "
+                "appears incorrect. See FITS Standard Section 7.3.3.",
+                col, tform, tdisp_format_name(tdisp_fmt), tdisp_val,
+                sample, valtype);
+        } else {
+            /* No sample (empty table or read failed) — generic */
+            FV_HINT_SET_FIX(ctx,
+                "Either change TFORM%d to '%s' if the column holds "
+                "%s values, or change %s to 'A%d' for character display.",
+                col, suggested_tform, valtype, kw_name, aw);
+            FV_HINT_SET_EXPLAIN(ctx,
+                "Column %d is declared as character data (TFORM '%s') "
+                "but has a %s display format ('%s'). This often means "
+                "the column holds %s values stored as text. "
+                "See FITS Standard Section 7.3.3.",
+                col, tform, tdisp_format_name(tdisp_fmt), tdisp_val,
+                valtype);
+        }
+    } else {
+        /* Non-character column with wrong display format.
+           Less common; usually the TDISP is simply wrong. */
+        FV_HINT_SET_FIX(ctx,
+            "Column %d has TFORM '%s'; use %s format for %s.",
+            col, tform, tdisp_suggestion(tform), kw_name);
+        FV_HINT_SET_EXPLAIN(ctx,
+            "Column %d is declared as %s data (TFORM '%s') but has "
+            "a %s display format ('%s'). "
+            "Either the column's TFORM or its TDISPn is incorrect. "
+            "See FITS Standard Section 7.3.3.",
+            col, tform_type_name(tform_char), tform,
+            tdisp_format_name(tdisp_fmt), tdisp_val);
+    }
+}
+
+/* ---- DATE keyword hint helper ------------------------------------------- */
+
+/* Try to convert a non-ISO date string to ISO 8601 format.
+   Handles ctime format ("Wed Jul 22 16:44:17 2009").
+   Returns 1 if successful and writes to iso_buf, 0 if unrecognized. */
+static int try_convert_date(const char *value, char *iso_buf, size_t buflen)
+{
+    static const char *months[] = {"Jan","Feb","Mar","Apr","May","Jun",
+                                    "Jul","Aug","Sep","Oct","Nov","Dec"};
+    char wday[4], mon_str[4];
+    int day, hour, min, sec, year;
+
+    /* ctime format: "Wed Jul 22 16:44:17 2009" */
+    if (sscanf(value, "%3s %3s %d %d:%d:%d %d",
+               wday, mon_str, &day, &hour, &min, &sec, &year) == 7) {
+        int mon = 0;
+        for (int m = 0; m < 12; m++) {
+            if (mon_str[0] == months[m][0] &&
+                mon_str[1] == months[m][1] &&
+                mon_str[2] == months[m][2]) { mon = m + 1; break; }
+        }
+        if (mon > 0 && year > 0 && day >= 1 && day <= 31) {
+            snprintf(iso_buf, buflen, "%04d-%02d-%02dT%02d:%02d:%02d",
+                     year, mon, day, hour, min, sec);
+            return 1;
+        }
+    }
+
+    return 0;
+}
 
 
 /******************************************************************************
@@ -20,86 +298,39 @@ the following are only needed if one calls wcslib
 *      Verify individual fits file.
 *
 *******************************************************************************/
-/* routine to verify individual fitsfile */
-int verify_fits(fv_context *ctx, char *infile, FILE *out)
+/*
+ * verify_fits_fptr — verify an already-opened FITS file pointer.
+ *
+ * Takes ownership of infits for the duration and closes it before returning.
+ * rootnam is used only for init_report labeling (may be "").
+ */
+int verify_fits_fptr(fv_context *ctx, fitsfile *infits, FILE *out)
 {
-    char rootnam[FLEN_FILENAME] = "";   /* Input Fits file root name */
-    fitsfile *infits;                   /* input fits file pointer */
-    FitsHdu fitshdu;                    /* hdu information */
+    FitsHdu fitshdu;
     int hdutype;
     int status = 0;
     int i;
-    int len;
-    char *p;
-    char *pfile;
     char xtension[80];
-
-    /* take out the leading and trailing space and skip the empty line*/
-    p = infile;
-    while(isspace((int)*p) )p++;
-    len = strlen(p);
-    pfile = p;
-    p += (len -1);
-    for (i = len - 1; i >= 0 && isspace((int)*p); i--) {*p = '\0'; p--;}
-    if(!strlen(pfile)) return status;
-
-#ifndef WEBTOOL
-    wrtout(out," ");
-    sprintf(ctx->comm,"File: %s",pfile);
-    wrtout(out,ctx->comm);
-#endif
-
-    ctx->totalhdu = 0;
-
-#ifndef STANDALONE
-    /* discard the extension, rowfilter... */
-    if(ffrtnm(pfile, rootnam, &status)) {
-        wrtserr(ctx, out,"",&status,2);
-        leave_early(ctx, out);
-        status = 1;
-        return status;
-    }
-
-    if(fits_open_file(&infits, rootnam, READONLY, &status)) {
-        wrtserr(ctx, out,"",&status,2);
-        leave_early(ctx, out);
-        status = 1;
-        return status;
-    }
-#else
-    if(fits_open_diskfile(&infits, pfile, READONLY, &status)) {
-        wrtserr(ctx, out,"",&status,2);
-        leave_early(ctx, out);
-        status = 1;
-        return status;
-    }
-#endif
 
     /* get the total hdus */
     if(fits_get_num_hdus(infits, &ctx->totalhdu, &status)) {
-        wrtserr(ctx, out,"",&status,2);
+        wrtserr(ctx, out,"",&status,2, FV_ERR_CFITSIO_STACK);
         leave_early(ctx, out);
+        fits_close_file(infits, &status);
         status = 1;
         return status;
     }
 
     /* initialize the report */
-    init_report(ctx, out,rootnam);
+    init_report(ctx, out, "");
 
-    /* Set up abort mechanism - longjmp returns here on MAXERRORS */
-    ctx->abort_set = 1;
-    if (setjmp(ctx->abort_jmp) != 0) {
-        ctx->abort_set = 0;
-        fits_close_file(infits, &status);
-        return 1;
-    }
     /*------------------  Hdu Loop --------------------------------*/
     for (i = 1; i <= ctx->totalhdu; i++) {
         /* move to the right hdu and do the CFITSIO test */
         hdutype = -1;
         if(fits_movabs_hdu(infits,i, &hdutype, &status) ) {
             print_title(ctx, out,i, hdutype);
-            wrtferr(ctx, out,"",&status,2);
+            wrtferr(ctx, out,"",&status,2, FV_ERR_CFITSIO);
             set_hdubasic(ctx, i,hdutype);
             break;
         }
@@ -111,7 +342,7 @@ int verify_fits(fv_context *ctx, char *infile, FILE *out)
                print_title(ctx, out,i, BINARY_TBL);
 	   else
 	       print_title(ctx, out,i, hdutype);
-        }  
+        }
         else
                print_title(ctx, out,i, hdutype);
 
@@ -120,7 +351,7 @@ int verify_fits(fv_context *ctx, char *infile, FILE *out)
 
         test_hdu(ctx, infits,out,&fitshdu);          /* test hdu header */
 
-        if(ctx->testdata)
+        if(ctx->testdata && !ctx->maxerrors_reached)
             test_data(ctx, infits,out,&fitshdu);
 
         close_err(ctx, out);                         /* end of error report */
@@ -130,9 +361,13 @@ int verify_fits(fv_context *ctx, char *infile, FILE *out)
         if(ctx->prstat)
             print_summary(ctx, infits,out,&fitshdu);
         close_hdu(ctx, &fitshdu);                    /* clear the fitshdu  */
+
+        if(ctx->maxerrors_reached)
+            break;
     }
     /* test the end of file  */
-    test_end(ctx, infits,out);
+    if(!ctx->maxerrors_reached)
+        test_end(ctx, infits,out);
 
     /*------------------ Closing  --------------------------------*/
     /* closing the report*/
@@ -144,10 +379,46 @@ int verify_fits(fv_context *ctx, char *infile, FILE *out)
     return status;
 }
 
+/* routine to verify individual fitsfile */
+int verify_fits(fv_context *ctx, char *infile, FILE *out)
+{
+    char rootnam[FLEN_FILENAME] = "";   /* Input Fits file root name */
+    fitsfile *infits;                   /* input fits file pointer */
+    int status = 0;
+    int i;
+    int len;
+    char *p;
+    char *pfile;
+
+    /* take out the leading and trailing space and skip the empty line*/
+    p = infile;
+    while(isspace((int)*p) )p++;
+    len = strlen(p);
+    pfile = p;
+    p += (len -1);
+    for (i = len - 1; i >= 0 && isspace((int)*p); i--) {*p = '\0'; p--;}
+    if(!strlen(pfile)) return status;
+
+    wrtout(ctx, out," ");
+    snprintf(ctx->comm, sizeof(ctx->comm), "File: %s", pfile);
+    wrtout(ctx, out,ctx->comm);
+
+    ctx->totalhdu = 0;
+
+    if(fits_open_diskfile(&infits, pfile, READONLY, &status)) {
+        wrtserr(ctx, out,"",&status,2, FV_ERR_CFITSIO_STACK);
+        leave_early(ctx, out);
+        status = 1;
+        return status;
+    }
+
+    return verify_fits_fptr(ctx, infits, out);
+}
+
 void leave_early (fv_context *ctx, FILE* out)
 {
-    sprintf(ctx->comm,"**** Abort Verification: Fatal Error. ****");
-    wrtout(out,ctx->comm);
+    snprintf(ctx->comm, sizeof(ctx->comm),"**** Abort Verification: Fatal Error. ****");
+    wrtout(ctx, out,ctx->comm);
 
     /* write the total number of errors and warnings to parfile*/
     update_parfile(ctx, 1,0);
@@ -157,7 +428,7 @@ void close_err(fv_context *ctx, FILE* out)
 {
     int merr, mwrn;
     num_err_wrn(ctx, &merr, &mwrn);
-    if(merr || mwrn ) wrtout(out," ");
+    if(merr || mwrn ) wrtout(ctx, out," ");
     return;
 }
 
@@ -204,13 +475,13 @@ void init_hdu(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
     if (lv > 0) { 
         m = (lv - 1)/80 + 1; 
         n = lv - (m - 1) * 80; 
-        sprintf(ctx->errmes,
+        snprintf(ctx->errmes, sizeof(ctx->errmes),
           "Byte #%d in Card#%d is a null(\\0).",n,m);
-        wrterr(ctx, out,ctx->errmes,1);
+        wrterr(ctx, out,ctx->errmes,1, FV_ERR_NONASCII_HEADER);
         status = 0;
     } else { 
         if (status) { 
-	    wrtserr(ctx, out,"",&status,1);  
+	    wrtserr(ctx, out,"",&status,1, FV_ERR_CFITSIO_STACK);
             status = 0;
         } 
     }
@@ -218,8 +489,8 @@ void init_hdu(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
     /* get the total number of keywords */
     hduptr->nkeys = 0; 
     morekeys = 0;
-    if(fits_get_hdrspace(infits, &(hduptr->nkeys), &morekeys, &status))  
-        wrtferr(ctx, out,"",&status,1);
+    if(fits_get_hdrspace(infits, &(hduptr->nkeys), &morekeys, &status))
+        wrtferr(ctx, out,"",&status,1, FV_ERR_CFITSIO);
     (hduptr->nkeys)++; 	/* include END keyword */
 
  
@@ -231,8 +502,8 @@ void init_hdu(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
     }
 
     for (i=1; i <= ctx->ncards; i++) { 
-        if(fits_read_record(infits, i, ctx->cards[i-1], &status)) 
-	    wrtferr(ctx, out,"",&status,1); 
+        if(fits_read_record(infits, i, ctx->cards[i-1], &status))
+	    wrtferr(ctx, out,"",&status,1, FV_ERR_CFITSIO);
     }
 
     /* if there were blank ctx->cards prior to the END card, then
@@ -247,23 +518,30 @@ void init_hdu(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
     fits_parse_card(ctx, out, 1, ctx->cards[0], tmpkey.kname, 
         &(tmpkey.ktype), tmpkey.kvalue,ctx->comm); 
     if( *(tmpkey.kvalue) == ' ') {
-         sprintf(ctx->errmes,
+         snprintf(ctx->errmes, sizeof(ctx->errmes),
      "Keyword #1, %s \"%s\" should not have leading space.",
-                 tmpkey.kname,tmpkey.kvalue); 
-         wrterr(ctx, out,ctx->errmes,1);  
+                 tmpkey.kname,tmpkey.kvalue);
+         FV_HINT_SET_KEYWORD(ctx, tmpkey.kname);
+         wrterr(ctx, out,ctx->errmes,1, FV_ERR_LEADING_SPACE);
     } 
     if(hdunum == 1) { /* SIMPLE should be logical T */
-        if(strcmp(tmpkey.kname,"SIMPLE"))  
-            wrterr(ctx, out, "The 1st keyword of a primary array is not SIMPLE.",1);
-        if( !check_log(ctx, &tmpkey,out)|| strcmp(tmpkey.kvalue,"T")) 
+        if(strcmp(tmpkey.kname,"SIMPLE")) {
+            FV_HINT_SET_KEYWORD(ctx, "SIMPLE");
+            wrterr(ctx, out, "The 1st keyword of a primary array is not SIMPLE.",1, FV_ERR_MISSING_KEYWORD);
+        }
+        if( !check_log(ctx, &tmpkey,out)|| strcmp(tmpkey.kvalue,"T")) {
+	    FV_HINT_SET_KEYWORD(ctx, "SIMPLE");
 	    wrtwrn(ctx, out,
-    "SIMPLE != T indicates file may not conform to the FITS Standard.",0);
+    "SIMPLE != T indicates file may not conform to the FITS Standard.",0, FV_WARN_SIMPLE_FALSE);
+        }
 
         check_fixed_log(ctx, ctx->cards[0], out);
     }
     else {
-        if(strcmp(tmpkey.kname,"XTENSION"))  
-            wrterr(ctx, out, "The 1st keyword of a extension is not XTENSION.",1);
+        if(strcmp(tmpkey.kname,"XTENSION")) {
+            FV_HINT_SET_KEYWORD(ctx, "XTENSION");
+            wrterr(ctx, out, "The 1st keyword of a extension is not XTENSION.",1, FV_ERR_MISSING_KEYWORD);
+        }
 	check_str(ctx, &tmpkey,out); 
 
         check_fixed_str(ctx, ctx->cards[0], out);
@@ -280,14 +558,26 @@ void init_hdu(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
 	    strncmp(p,"FOREIGN ",8)  && 
 	    strncmp(p,"DUMP    ",8)  && 
 	    strncmp(p,"IMAGE   ",8)  )   { 
-            sprintf(ctx->errmes, "Unregistered XTENSION value \"%8.8s\".",p);
-            wrterr(ctx, out,ctx->errmes,1);
+            snprintf(ctx->errmes, sizeof(ctx->errmes), "Unregistered XTENSION value \"%8.8s\".",p);
+            FV_HINT_SET_KEYWORD(ctx, "XTENSION");
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_KEYWORD_VALUE);
         }
-        else { 
-            if  (p[8] != '\'') { 
-                sprintf(ctx->errmes, 
+        else {
+            if  (p[8] != '\'') {
+                snprintf(ctx->errmes, sizeof(ctx->errmes),
          "Extra \'%c\' follows the XTENSION value \"%8.8s\".",p[8],p);
-                wrterr(ctx, out,ctx->errmes,1);
+                FV_HINT_SET_KEYWORD(ctx, "XTENSION");
+                wrterr(ctx, out,ctx->errmes,1, FV_ERR_KEYWORD_VALUE);
+            }
+
+            /* Warn about legacy/non-standard XTENSION values (FITS 4.0) */
+            if (!strncmp(p,"A3DTABLE",8) || !strncmp(p,"IUEIMAGE",8) ||
+                !strncmp(p,"FOREIGN ",8) || !strncmp(p,"DUMP    ",8)) {
+                snprintf(ctx->errmes, sizeof(ctx->errmes),
+                    "XTENSION value \"%8.8s\" is not part of the FITS Standard. "
+                    "Standard values are IMAGE, TABLE, and BINTABLE.", p);
+                FV_HINT_SET_KEYWORD(ctx, "XTENSION");
+                wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_LEGACY_XTENSION);
             }
         }
 
@@ -305,13 +595,13 @@ void init_hdu(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
 
     /* read the BITPIX keywords */ 
     if(fits_read_key(infits, TINT, "BITPIX", &(hduptr->bitpix), NULL, &status))
-         wrtferr(ctx, out,"",&status,2);
+         wrtferr(ctx, out,"",&status,2, FV_ERR_CFITSIO);
     check_fixed_int(ctx, ctx->cards[1], out);
 
     /* Read and Parse the NAXIS */
     hduptr->naxis = 0;
-    if(fits_read_key(infits, TINT, "NAXIS", &(hduptr->naxis), NULL, &status))  
-         wrtferr(ctx, out,"",&status,2);
+    if(fits_read_key(infits, TINT, "NAXIS", &(hduptr->naxis), NULL, &status))
+         wrtferr(ctx, out,"",&status,2, FV_ERR_CFITSIO);
     check_fixed_int(ctx, ctx->cards[2], out);
 
     if(hduptr->naxis!=0)  
@@ -331,19 +621,21 @@ void init_hdu(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
 #endif
         lv = strtol(p,NULL,10); 
         if(lv > hduptr->naxis && lv <= 0) {      
-            sprintf(ctx->errmes,
-                  "Keyword #%d, %s is not allowed (with n > NAXIS = %d).", 
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
+                  "Keyword #%d, %s is not allowed (with n > NAXIS = %d).",
                    tmpkey.kindex,tmpkey.kname,hduptr->naxis);
-            wrterr(ctx, out,ctx->errmes,1); 
+            FV_HINT_SET_KEYWORD(ctx, tmpkey.kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_KEYWORD_VALUE);
         } 
         else {
              if(hduptr->naxes[lv-1] == -1) { 
                  hduptr->naxes[lv-1] = lu;
              }
              else { 
-                 sprintf(ctx->errmes, "Keyword #%d, %s is duplicated.", 
+                 snprintf(ctx->errmes, sizeof(ctx->errmes), "Keyword #%d, %s is duplicated.",
                    tmpkey.kindex,tmpkey.kname);
-                 wrterr(ctx, out,ctx->errmes,1);
+                 FV_HINT_SET_KEYWORD(ctx, tmpkey.kname);
+                 wrterr(ctx, out,ctx->errmes,1, FV_ERR_KEYWORD_DUPLICATE);
              }
         }
 
@@ -353,9 +645,11 @@ void init_hdu(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
     /* check all the NAXISn are there */
     for (j = 0; j < hduptr->naxis; j++) { 
          if(hduptr->naxes[j] == -1) { 
-             sprintf(ctx->errmes, 
+             snprintf(ctx->errmes, sizeof(ctx->errmes),
             "Keyword NAXIS%d is not present or is out of order.", j+1);
-             wrterr(ctx, out,ctx->errmes,2);
+             { char _kw[16]; snprintf(_kw, sizeof(_kw), "NAXIS%d", j+1);
+               FV_HINT_SET_KEYWORD(ctx, _kw); }
+             wrterr(ctx, out,ctx->errmes,2, FV_ERR_KEYWORD_ORDER);
          } 
     }
        
@@ -363,8 +657,8 @@ void init_hdu(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
     hduptr->ncols = 1; 
     if(hduptr->hdutype == ASCII_TBL || hduptr->hdutype == BINARY_TBL) {  
         /* get the total number of columns  */
-        if(fits_get_num_cols(infits, &(hduptr->ncols),&status)) 
-            wrtferr(ctx, out,"",&status,2);	 
+        if(fits_get_num_cols(infits, &(hduptr->ncols),&status))
+            wrtferr(ctx, out,"",&status,2, FV_ERR_CFITSIO);
     }
            
     /* parse the keywords after NAXISn and prepare the array for 
@@ -389,10 +683,10 @@ void init_hdu(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
 		     
 	if (kwds[i]->ktype == UNKNOWN && *(kwds[i]->kvalue) == 0)
 	{
-	    sprintf(ctx->errmes,
-               "Keyword #%d, %s has a null value.", 
-                j+1,kwds[i]->kname); 
-            wrtwrn(ctx, out,ctx->errmes,0);
+	    snprintf(ctx->errmes, sizeof(ctx->errmes),
+               "Keyword #%d, %s has a null value.",
+                j+1,kwds[i]->kname);
+            wrtwrn(ctx, out,ctx->errmes,0, FV_OK);
 	}
 
         /* only count the non-commentary keywords */ 
@@ -560,10 +854,23 @@ void test_hdu(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
     key_match(ctx->tmpkwds,numusrkey,&ctx->ptemp,1,&k,&n);
     if(k > -1) {
        if(primary_naxis != 0) {
-         sprintf(ctx->errmes,
+         snprintf(ctx->errmes, sizeof(ctx->errmes),
             "Keyword #%d, %s cannot be used if the primary array contains data (NAXIS != 0).",
              kwds[k]->kindex, kwds[k]->kname);
-         wrtwrn(ctx, out,ctx->errmes,0);
+         FV_HINT_SET_KEYWORD(ctx, "INHERIT");
+         FV_HINT_SET_FIX(ctx,
+             "Remove INHERIT from HDU %d. INHERIT = T tells readers to "
+             "merge the primary header into an extension, but is only "
+             "valid in extensions when the primary HDU has NAXIS = 0 "
+             "(no data). This primary HDU has NAXIS = %d.",
+             ctx->curhdu, primary_naxis);
+         FV_HINT_SET_EXPLAIN(ctx,
+             "INHERIT = T allows extensions to inherit keywords from the "
+             "primary header, avoiding duplication. However, if the primary "
+             "array contains data (NAXIS > 0), the inherited keywords could "
+             "conflict with the extension's own keywords. "
+             "See FITS Standard Section 4.4.2.4.");
+         wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_INHERIT_PRIMARY);
        }
        check_log(ctx, kwds[k],out);
     }
@@ -649,40 +956,44 @@ void test_hdu(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
 	    if (i == 2 ) {  /* test that CDELTi != 0 */
 		dvalue = strtod(pkey->kvalue, NULL);
 		if (dvalue == 0.) {
-		    sprintf( ctx->errmes, 
+		    snprintf(ctx->errmes, sizeof(ctx->errmes),
             "Keyword #%d, %s: must have non-zero value.",
                    pkey->kindex,pkey->kname);
-                   wrterr(ctx, out,ctx->errmes,1);
+                   FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+                   wrterr(ctx, out,ctx->errmes,1, FV_ERR_RESERVED_VALUE);
 		}
 	    }
 
 	    if (i == 4 || i == 5 ) {  /* test that CRDERi and CSYSERi are non-negative */
 		dvalue = strtod(pkey->kvalue, NULL);
 		if (dvalue < 0.) {
-		    sprintf( ctx->errmes, 
+		    snprintf(ctx->errmes, sizeof(ctx->errmes),
             "Keyword #%d, %s: must have non-negative value: %s",
                    pkey->kindex,pkey->kname,pkey->kvalue);
-                   wrterr(ctx, out,ctx->errmes,1);
+                   FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+                   wrterr(ctx, out,ctx->errmes,1, FV_ERR_RESERVED_VALUE);
 		}
 	    }
 
             m = (int)strtol(p,&p2,10);
             if (wcsaxesExists) {     /* WCSAXES keyword exists */
 
-              if (m < 1 || m > wcsaxes) { 
-                 sprintf( ctx->errmes, 
+              if (m < 1 || m > wcsaxes) {
+                 snprintf(ctx->errmes, sizeof(ctx->errmes),
             "Keyword #%d, %s: index %d is not in range 1-%d (WCSAXES).",
                    pkey->kindex,pkey->kname,m,wcsaxes);
-                   wrterr(ctx, out,ctx->errmes,1);
+                   FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+                   wrterr(ctx, out,ctx->errmes,1, FV_ERR_WCS_INDEX);
               }
 
             } else {
 
-                if (m < 1 || m > hduptr->naxis) { 
-                  sprintf( ctx->errmes, 
+                if (m < 1 || m > hduptr->naxis) {
+                  snprintf(ctx->errmes, sizeof(ctx->errmes),
                   "Keyword #%d, %s: index %d is not in range 1-%d (NAXIS).",
                    pkey->kindex,pkey->kname,m,hduptr->naxis);
-                   wrtwrn(ctx, out,ctx->errmes,0);
+                   FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+                   wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_WCS_INDEX);
                 }
             }
 
@@ -709,14 +1020,16 @@ void test_hdu(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
     }
 
     if (keynum[0] < nmax) { /* test number of CRPIXi keywords */
-             sprintf( ctx->errmes, 
+             snprintf(ctx->errmes, sizeof(ctx->errmes),
             "Some CRPIXi keywords appear to be missing; expected %d.",nmax);
-             wrtwrn(ctx, out,ctx->errmes,0);
+             FV_HINT_SET_KEYWORD(ctx, "CRPIX");
+             wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_WCS_INDEX);
     }
     if (keynum[1] < nmax) { /* test number of CRVALi keywords */
-             sprintf( ctx->errmes, 
+             snprintf(ctx->errmes, sizeof(ctx->errmes),
             "Some CRVALi keywords appear to be missing; expected %d.",nmax);
-             wrtwrn(ctx, out,ctx->errmes,0);
+             FV_HINT_SET_KEYWORD(ctx, "CRVAL");
+             wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_WCS_INDEX);
     }
 
     /* test datatype of reserved non-indexed floating point WCS keywords */
@@ -761,20 +1074,22 @@ void test_hdu(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
 
             if (wcsaxesExists) {     /* WCSAXES keyword exists */
 
-              if (m < 1 || m > wcsaxes) { 
-                 sprintf( ctx->errmes, 
+              if (m < 1 || m > wcsaxes) {
+                 snprintf(ctx->errmes, sizeof(ctx->errmes),
             "Keyword #%d, %s: 1st index %d is not in range 1-%d (WCSAXES).",
                    pkey->kindex,pkey->kname,m,wcsaxes);
-                   wrterr(ctx, out,ctx->errmes,1);
+                   FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+                   wrterr(ctx, out,ctx->errmes,1, FV_ERR_WCS_INDEX);
               }
 
             } else {
 
-              if (m < 1 || m > hduptr->naxis) { 
-                sprintf( ctx->errmes, 
+              if (m < 1 || m > hduptr->naxis) {
+                snprintf(ctx->errmes, sizeof(ctx->errmes),
             "Keyword #%d, %s: 1st index %d is not in range 1-%d (NAXIS).",
                    pkey->kindex,pkey->kname,m,hduptr->naxis);
-                   wrtwrn(ctx, out,ctx->errmes,0);
+                   FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+                   wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_WCS_INDEX);
               }
  
             }
@@ -785,20 +1100,22 @@ void test_hdu(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
 
             if (wcsaxesExists) {     /* WCSAXES keyword exists */
 
-              if (m < 1 || m > wcsaxes) { 
-                 sprintf( ctx->errmes, 
+              if (m < 1 || m > wcsaxes) {
+                 snprintf(ctx->errmes, sizeof(ctx->errmes),
             "Keyword #%d, %s: 2nd index %d is not in range 1-%d (WCSAXES).",
                    pkey->kindex,pkey->kname,m,wcsaxes);
-                   wrterr(ctx, out,ctx->errmes,1);
+                   FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+                   wrterr(ctx, out,ctx->errmes,1, FV_ERR_WCS_INDEX);
               }
 
             } else {
 
-                if (m < 1 || m > hduptr->naxis) { 
-                sprintf( ctx->errmes, 
+                if (m < 1 || m > hduptr->naxis) {
+                snprintf(ctx->errmes, sizeof(ctx->errmes),
                 "Keyword #%d, %s: 2nd index %d is not in range 1-%d (NAXIS).",
                    pkey->kindex,pkey->kname,m,hduptr->naxis);
-                   wrtwrn(ctx, out,ctx->errmes,0);
+                   FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+                   wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_WCS_INDEX);
                 }
             }
 
@@ -815,17 +1132,19 @@ void test_hdu(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
     }
 
     if (matrix_exists[0] > 0 && matrix_exists[1] > 0 ) {
-       sprintf( ctx->errmes, 
+       snprintf(ctx->errmes, sizeof(ctx->errmes),
             "Keywords PCi_j (#%d) and CDi_j (#%d) are mutually exclusive.",
                    matrix_exists[0],matrix_exists[1]);
-                   wrterr(ctx, out,ctx->errmes,1);
+                   FV_HINT_SET_KEYWORD(ctx, "PCi_j");
+                   wrterr(ctx, out,ctx->errmes,1, FV_ERR_RESERVED_VALUE);
     }
 
     if (matrix_exists[0] > 0 && crota2_exists > 0 ) {
-       sprintf( ctx->errmes, 
+       snprintf(ctx->errmes, sizeof(ctx->errmes),
             "Keywords PCi_j (#%d) and CROTA2 (#%d) are mutually exclusive.",
                    matrix_exists[0],crota2_exists);
-                   wrterr(ctx, out,ctx->errmes,1);
+                   FV_HINT_SET_KEYWORD(ctx, "CROTA2");
+                   wrterr(ctx, out,ctx->errmes,1, FV_ERR_RESERVED_VALUE);
     }
 
     /* test datatype of reserved indexed string WCS keywords */
@@ -850,22 +1169,24 @@ void test_hdu(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
 
             if (wcsaxesExists) {     /* WCSAXES keyword exists */
 
-              if (m < 1 || m > wcsaxes) { 
-                 sprintf( ctx->errmes, 
+              if (m < 1 || m > wcsaxes) {
+                 snprintf(ctx->errmes, sizeof(ctx->errmes),
             "Keyword #%d, %s: index %d is not in range 1-%d (WCSAXES).",
                    pkey->kindex,pkey->kname,m,wcsaxes);
-                   wrterr(ctx, out,ctx->errmes,1);
+                   FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+                   wrterr(ctx, out,ctx->errmes,1, FV_ERR_WCS_INDEX);
               }
 
             } else {
 
-                if (m < 1 || m > hduptr->naxis) { 
-                   sprintf( ctx->errmes, 
+                if (m < 1 || m > hduptr->naxis) {
+                   snprintf(ctx->errmes, sizeof(ctx->errmes),
                    "Keyword #%d, %s: index %d is not in range 1-%d (NAXIS).",
                    pkey->kindex,pkey->kname,m,hduptr->naxis);
-                   wrtwrn(ctx, out,ctx->errmes,0);
-                } 
- 
+                   FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+                   wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_WCS_INDEX);
+                }
+
             }
 
 	    if (*p2 == 0) {  /* only test the primary set of WCS keywords */
@@ -877,20 +1198,22 @@ void test_hdu(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
 	        wcskeypos = pkey->kindex;
 		pname = pkey->kname;
 	    }
-        } 
+        }
     }
 
     if (keynum[0] < nmax) {
-             sprintf( ctx->errmes, 
+             snprintf(ctx->errmes, sizeof(ctx->errmes),
             "Some CTYPEi keywords appear to be missing; expected %d.",nmax);
-             wrtwrn(ctx, out,ctx->errmes,0);
+             FV_HINT_SET_KEYWORD(ctx, "CTYPE");
+             wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_WCS_INDEX);
     }
 
-    if (wcskeypos < wcsaxespos) { 
-             sprintf( ctx->errmes, 
+    if (wcskeypos < wcsaxespos) {
+             snprintf(ctx->errmes, sizeof(ctx->errmes),
             "WCSAXES keyword #%d appears after other WCS keyword %s #%d",
 	       wcsaxespos, pname, wcskeypos);
-             wrterr(ctx, out,ctx->errmes,1);
+             FV_HINT_SET_KEYWORD(ctx, "WCSAXES");
+             wrterr(ctx, out,ctx->errmes,1, FV_ERR_WCSAXES_ORDER);
     }
 
     /* test datatype and value of reserved RADECSYS WCS keywords */
@@ -910,16 +1233,17 @@ void test_hdu(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
 
 	    if (!check_str(ctx, pkey,out) )continue;
 
-            if (strcmp(pkey->kvalue, "ICRS") && strcmp(pkey->kvalue, "FK5") && 
-	        strcmp(pkey->kvalue, "FK4") && strcmp(pkey->kvalue, "FK4-NO-E") && 
+            if (strcmp(pkey->kvalue, "ICRS") && strcmp(pkey->kvalue, "FK5") &&
+	        strcmp(pkey->kvalue, "FK4") && strcmp(pkey->kvalue, "FK4-NO-E") &&
 		strcmp(pkey->kvalue, "GAPPT")) {
-                   sprintf( ctx->errmes, 
+                   snprintf(ctx->errmes, sizeof(ctx->errmes),
                    "Keyword #%d, %s has non-allowed value: %s",
                    pkey->kindex,pkey->kname,pkey->kvalue);
-                   wrtwrn(ctx, out,ctx->errmes,0);
+                   FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+                   wrtwrn(ctx, out,ctx->errmes,0, FV_OK);
 	    }
- 
-        } 
+
+        }
     }
 
     /* test datatype and value of reserved spectral ref frame WCS keywords */
@@ -944,20 +1268,21 @@ void test_hdu(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
 	        strcmp(pkey->kvalue, "LSRK") && strcmp(pkey->kvalue, "LSRD") && 
 	        strcmp(pkey->kvalue, "GALACTOC") && strcmp(pkey->kvalue, "LOCALGRP") && 
 	        strcmp(pkey->kvalue, "CMBDIPOL") && strcmp(pkey->kvalue, "SOURCE")) {
-                   sprintf( ctx->errmes, 
+                   snprintf(ctx->errmes, sizeof(ctx->errmes),
                    "Keyword #%d, %s has non-allowed value: %s",
                    pkey->kindex,pkey->kname,pkey->kvalue);
-                   wrtwrn(ctx, out,ctx->errmes,0);
+                   FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+                   wrtwrn(ctx, out,ctx->errmes,0, FV_OK);
 	    }
- 
-        } 
+
+        }
     }
 
     /* test the fill area */ 
     if(ctx->testfill) { 
 	if(ffchfl(infits,&status)) { 
-	    wrterr(ctx, out, 
-          "The header fill area is not totally filled with blanks.",1);
+	    wrterr(ctx, out,
+          "The header fill area is not totally filled with blanks.",1, FV_ERR_HEADER_FILL);
         }
     }
     return ; 
@@ -1001,13 +1326,14 @@ void test_prm(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
         key_match(ctx->tmpkwds,numusrkey,&ctx->ptemp,1,&k,&n); 
         if( n > 0) { 
             pkey = hduptr->kwds[k]; 
-	    sprintf(ctx->errmes,
-               "Keyword #%d, %s is not allowed in a primary array.", 
-                pkey->kindex,exlkey[i]); 
-            wrterr(ctx, out,ctx->errmes,1);
+	    snprintf(ctx->errmes, sizeof(ctx->errmes),
+               "Keyword #%d, %s is not allowed in a primary array.",
+                pkey->kindex,exlkey[i]);
+            FV_HINT_SET_KEYWORD(ctx, exlkey[i]);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_KEYWORD_NOT_ALLOWED);
         }
-    } 
-   
+    }
+
     /* Check if Random Groups file */   
     strcpy(temp,"GROUPS");
     ctx->ptemp = temp;
@@ -1016,6 +1342,11 @@ void test_prm(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
         pkey = hduptr->kwds[k]; 
 	if(*(pkey->kvalue) == 'T' && hduptr->naxis > 0 && hduptr->naxes[0]==0) {
           hduptr->isgroup = 1;
+          wrtwrn(ctx, out,
+              "This HDU uses the Random Groups convention, "
+              "which has been deprecated since FITS Standard Version 1. "
+              "Consider using a binary table extension instead.",
+              0, FV_WARN_RANDOM_GROUPS);
 
           check_fixed_log(ctx, ctx->cards[pkey->kindex - 1], out);
         }
@@ -1033,27 +1364,41 @@ void test_prm(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
            pkey = hduptr->kwds[k]; 
 
 	   if(check_log(ctx, pkey,out) && *(pkey->kvalue)!='T' && ctx->totalhdu > 1) {
-	      sprintf(ctx->errmes,"There are extensions but EXTEND = F.");
-              wrterr(ctx, out,ctx->errmes,1); 
+	      snprintf(ctx->errmes, sizeof(ctx->errmes),"There are extensions but EXTEND = F.");
+              FV_HINT_SET_KEYWORD(ctx, "EXTEND");
+              wrterr(ctx, out,ctx->errmes,1, FV_ERR_KEYWORD_VALUE);
            }
        }
     }
       
-    /* Check PCOUNT and GCOUNT  keyword */   
+    /* Check PCOUNT and GCOUNT  keyword */
     strcpy(temp,"PCOUNT");
     ctx->ptemp = temp;
-    key_match(ctx->tmpkwds,numusrkey,&ctx->ptemp,1,&k,&n);  
-    if(k > -1) {  
-        pkey = hduptr->kwds[k]; 
-        /* Primary array cannot have PCOUNT */ 
-	if (!hduptr->isgroup ){ 
-	    sprintf(ctx->errmes,
-           " Keyword #%d, %s is not allowed in a primary array.", 
-            pkey->kindex,pkey->kname); 
-            wrterr(ctx, out,ctx->errmes,1); 
+    key_match(ctx->tmpkwds,numusrkey,&ctx->ptemp,1,&k,&n);
+    if(k > -1) {
+        pkey = hduptr->kwds[k];
+        /* Primary array cannot have PCOUNT */
+	if (!hduptr->isgroup ){
+	    snprintf(ctx->errmes, sizeof(ctx->errmes),
+           " Keyword #%d, %s is not allowed in a primary array.",
+            pkey->kindex,pkey->kname);
+            FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+            FV_HINT_SET_FIX(ctx,
+                "Remove PCOUNT (= %s) from HDU %d. PCOUNT and GCOUNT are "
+                "required in extensions but not allowed in a standard "
+                "primary array. If this data should be an extension, use "
+                "XTENSION = 'IMAGE' instead of SIMPLE = T.",
+                pkey->kvalue, ctx->curhdu);
+            FV_HINT_SET_EXPLAIN(ctx,
+                "PCOUNT specifies the number of bytes of additional data "
+                "following the main data table (the 'heap' for variable-"
+                "length arrays). It is mandatory in extensions but must "
+                "not appear in the primary HDU unless Random Groups are "
+                "used (deprecated). See FITS Standard Section 4.4.1.");
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_KEYWORD_NOT_ALLOWED);
         }
-        else { 
-	    if(check_int(ctx, pkey,out))   
+        else {
+	    if(check_int(ctx, pkey,out))
 	        hduptr->pcount = (LONGLONG) atof(pkey->kvalue);
 
             check_fixed_int(ctx, ctx->cards[pkey->kindex - 1], out);
@@ -1062,18 +1407,31 @@ void test_prm(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
 
     strcpy(temp,"GCOUNT");
     ctx->ptemp = temp;
-    key_match(ctx->tmpkwds,numusrkey,&ctx->ptemp,1,&k,&n);  
-    if(k > -1) {  
-        pkey = hduptr->kwds[k]; 
-        /* Primary array cannot have GCOUNT */ 
-	if (!hduptr->isgroup ){ 
-	    sprintf(ctx->errmes,
-           " Keyword #%d, %s is not allowed in a primary array.", 
-            pkey->kindex,pkey->kname); 
-            wrterr(ctx, out,ctx->errmes,1); 
+    key_match(ctx->tmpkwds,numusrkey,&ctx->ptemp,1,&k,&n);
+    if(k > -1) {
+        pkey = hduptr->kwds[k];
+        /* Primary array cannot have GCOUNT */
+	if (!hduptr->isgroup ){
+	    snprintf(ctx->errmes, sizeof(ctx->errmes),
+           " Keyword #%d, %s is not allowed in a primary array.",
+            pkey->kindex,pkey->kname);
+            FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+            FV_HINT_SET_FIX(ctx,
+                "Remove GCOUNT (= %s) from HDU %d. PCOUNT and GCOUNT are "
+                "required in extensions but not allowed in a standard "
+                "primary array. If this data should be an extension, use "
+                "XTENSION = 'IMAGE' instead of SIMPLE = T.",
+                pkey->kvalue, ctx->curhdu);
+            FV_HINT_SET_EXPLAIN(ctx,
+                "GCOUNT specifies the number of groups in the data (always "
+                "1 for standard extensions). It is mandatory in extensions "
+                "but must not appear in the primary HDU unless Random "
+                "Groups are used (deprecated). "
+                "See FITS Standard Section 4.4.1.");
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_KEYWORD_NOT_ALLOWED);
         }
-        else { 
-	    if(check_int(ctx, pkey,out))   
+        else {
+	    if(check_int(ctx, pkey,out))
 	        hduptr->gcount = (int) strtol(pkey->kvalue,NULL,10);
 
             check_fixed_int(ctx, ctx->cards[pkey->kindex - 1], out);
@@ -1085,18 +1443,19 @@ void test_prm(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
     key_match(ctx->tmpkwds,numusrkey,&ctx->ptemp,1,&k,&n);
     if(k > -1) { 
          pkey = hduptr->kwds[k]; 
-         sprintf(ctx->errmes,
-            "Keyword #%d, %s is deprecated.", 
+         snprintf(ctx->errmes, sizeof(ctx->errmes),
+            "Keyword #%d, %s is deprecated.",
              pkey->kindex, pkey->kname);
-         wrtwrn(ctx, out,ctx->errmes,0);
+         FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+         wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_DEPRECATED);
 	 check_log(ctx, pkey,out);
 
 /*  no longer required
          if(pkey->kindex > 36) {
-                  sprintf(ctx->errmes,
+                  snprintf(ctx->errmes, sizeof(ctx->errmes),
                    "Keyword #%d, BLOCKED, appears beyond keyword 36.", 
                     pkey->kindex);
-                  wrterr(ctx, out,ctx->errmes,1);  
+                  wrterr(ctx, out,ctx->errmes,1, FV_ERR_KEYWORD_ORDER);
          }
 */
 
@@ -1112,34 +1471,37 @@ void test_prm(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
         if(!isdigit((int)*p)) continue;
 
         if (!(hduptr->isgroup)) {
-            sprintf(ctx->errmes,"Keyword #%d, %s ",
+            snprintf(ctx->errmes, sizeof(ctx->errmes),"Keyword #%d, %s ",
             kwds[j]->kindex,kwds[j]->kname);
             strcat(ctx->errmes,
               "is only allowed in Random Groups structures.");
-            wrterr(ctx, out,ctx->errmes,1);
+            FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_KEYWORD_NOT_ALLOWED);
             continue;
         }
 
-	if (check_flt(ctx, kwds[j],out) && strtod(kwds[j]->kvalue,NULL) == 0.0) { 
-            sprintf(ctx->errmes,"Keyword #%d, %s: ",
+	if (check_flt(ctx, kwds[j],out) && strtod(kwds[j]->kvalue,NULL) == 0.0) {
+            snprintf(ctx->errmes, sizeof(ctx->errmes),"Keyword #%d, %s: ",
             kwds[j]->kindex,kwds[j]->kname);
             strcat(ctx->errmes,
               "The scaling factor is zero.");
-            wrtwrn(ctx, out,ctx->errmes,0); 
+            FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+            wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_ZERO_SCALE);
         }
 
 	i = (int) strtol(p,NULL,10) -1 ;
         if(i< 0 || i >= hduptr->gcount) {
-            sprintf(ctx->errmes,
-      "Keyword #%d, %s: invalid index %d (> GCOUNT = %d).", 
-            kwds[j]->kindex,kwds[j]->kname,i+1,hduptr->gcount); 
-            wrterr(ctx, out,ctx->errmes,1);
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
+      "Keyword #%d, %s: invalid index %d (> GCOUNT = %d).",
+            kwds[j]->kindex,kwds[j]->kname,i+1,hduptr->gcount);
+            FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_INDEX_EXCEEDS_TFIELDS);
             continue;
         }
 
-    } 
+    }
 
-    /*  Check PZEROn keywords (only in Random Groups) */ 
+    /*  Check PZEROn keywords (only in Random Groups) */
     strcpy(temp,"PZERO");
     ctx->ptemp = temp;
     key_match(ctx->tmpkwds,numusrkey,&ctx->ptemp,0,&k,&n);  
@@ -1149,26 +1511,28 @@ void test_prm(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
         if(!isdigit((int)*p)) continue;
 
         if (!(hduptr->isgroup)) {
-            sprintf(ctx->errmes,"Keyword #%d, %s ",
+            snprintf(ctx->errmes, sizeof(ctx->errmes),"Keyword #%d, %s ",
             kwds[j]->kindex,kwds[j]->kname);
             strcat(ctx->errmes,
               "is only allowed in Random Groups structures.");
-            wrterr(ctx, out,ctx->errmes,1);
+            FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_KEYWORD_NOT_ALLOWED);
             continue;
         }
 
 	check_flt(ctx, kwds[j],out);
 	i = (int) strtol(p,NULL,10) -1 ;
         if(i< 0 || i >= hduptr->gcount) {
-            sprintf(ctx->errmes,
-      "Keyword #%d, %s: invalid index %d (> GCOUNT = %d).", 
-            kwds[j]->kindex,kwds[j]->kname,i+1,hduptr->gcount); 
-            wrterr(ctx, out,ctx->errmes,1);
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
+      "Keyword #%d, %s: invalid index %d (> GCOUNT = %d).",
+            kwds[j]->kindex,kwds[j]->kname,i+1,hduptr->gcount);
+            FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_INDEX_EXCEEDS_TFIELDS);
             continue;
-        }     
-    } 
+        }
+    }
 
-    /*  Check PTYPEn keywords (only in Random Groups) */ 
+    /*  Check PTYPEn keywords (only in Random Groups) */
     strcpy(temp,"PTYPE");
     ctx->ptemp = temp;
     key_match(ctx->tmpkwds,numusrkey,&ctx->ptemp,0,&k,&n);  
@@ -1178,24 +1542,26 @@ void test_prm(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
         if(!isdigit((int)*p)) continue;
 
         if (!(hduptr->isgroup)) {
-            sprintf(ctx->errmes,"Keyword #%d, %s ",
+            snprintf(ctx->errmes, sizeof(ctx->errmes),"Keyword #%d, %s ",
             kwds[j]->kindex,kwds[j]->kname);
             strcat(ctx->errmes,
               "is only allowed in Random Groups structures.");
-            wrterr(ctx, out,ctx->errmes,1);
+            FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_KEYWORD_NOT_ALLOWED);
             continue;
         }
 
 	check_str(ctx, kwds[j],out);
 	i = (int) strtol(p,NULL,10) -1 ;
         if(i< 0 || i >= hduptr->gcount) {
-            sprintf(ctx->errmes,
-      "Keyword #%d, %s: invalid index %d (> GCOUNT = %d).", 
-            kwds[j]->kindex,kwds[j]->kname,i+1,hduptr->gcount); 
-            wrterr(ctx, out,ctx->errmes,1);
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
+      "Keyword #%d, %s: invalid index %d (> GCOUNT = %d).",
+            kwds[j]->kindex,kwds[j]->kname,i+1,hduptr->gcount);
+            FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_INDEX_EXCEEDS_TFIELDS);
             continue;
-        }     
-    } 
+        }
+    }
     test_array(ctx, infits, out, hduptr);
         
     return;
@@ -1233,10 +1599,11 @@ void test_ext(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
     /* check the duplicate extensions */
     for (i = hdunum - 1; i > 0; i--) { 
         if(test_hduname(ctx, hdunum,i)) { 
-            sprintf(ctx->comm, 
-	    "The HDU %d and %d have identical type/name/version", 
+            snprintf(ctx->comm, sizeof(ctx->comm),
+	    "The HDU %d and %d have identical type/name/version",
                 hdunum,i);
-            wrtwrn(ctx, out,ctx->comm,0);
+            FV_HINT_SET_KEYWORD(ctx, "EXTNAME");
+            wrtwrn(ctx, out,ctx->comm,0, FV_WARN_DUPLICATE_EXTNAME);
         }
     }
 
@@ -1244,18 +1611,20 @@ void test_ext(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
     strcpy(temp,"PCOUNT");
     ctx->ptemp = temp;
     key_match(ctx->tmpkwds,numusrkey,&ctx->ptemp,1,&k,&n); 
-    if( k < 0) { 
-	sprintf(ctx->errmes,"cannot find the PCOUNT keyword.");
-        wrterr(ctx, out,ctx->errmes,1);
-    } 
+    if( k < 0) {
+	snprintf(ctx->errmes, sizeof(ctx->errmes),"cannot find the PCOUNT keyword.");
+        FV_HINT_SET_KEYWORD(ctx, "PCOUNT");
+        wrterr(ctx, out,ctx->errmes,1, FV_ERR_MISSING_KEYWORD);
+    }
     else {
-        pkey = hduptr->kwds[k]; 
-	if(check_int(ctx, pkey,out)) 
+        pkey = hduptr->kwds[k];
+	if(check_int(ctx, pkey,out))
 	    hduptr->pcount = (LONGLONG) atof(pkey->kvalue);
         if( pkey->kindex != 4 + hduptr->naxis ) {
-	     sprintf(ctx->errmes,"PCOUNT is not in record %d of the header.",
-                 hduptr->naxis + 4); 
-             wrterr(ctx, out,ctx->errmes,1);
+	     snprintf(ctx->errmes, sizeof(ctx->errmes),"PCOUNT is not in record %d of the header.",
+                 hduptr->naxis + 4);
+             FV_HINT_SET_KEYWORD(ctx, "PCOUNT");
+             wrterr(ctx, out,ctx->errmes,1, FV_ERR_KEYWORD_ORDER);
         } 
 
         check_fixed_int(ctx, ctx->cards[pkey->kindex - 1], out);
@@ -1265,18 +1634,20 @@ void test_ext(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
     strcpy(temp,"GCOUNT");
     ctx->ptemp = temp;
     key_match(ctx->tmpkwds,numusrkey,&ctx->ptemp,1,&k,&n); 
-    if( k < 0) { 
-	sprintf(ctx->errmes,"cannot find the GCOUNT keyword.");
-        wrterr(ctx, out,ctx->errmes,1);
-    } 
+    if( k < 0) {
+	snprintf(ctx->errmes, sizeof(ctx->errmes),"cannot find the GCOUNT keyword.");
+        FV_HINT_SET_KEYWORD(ctx, "GCOUNT");
+        wrterr(ctx, out,ctx->errmes,1, FV_ERR_MISSING_KEYWORD);
+    }
     else {
-        pkey = hduptr->kwds[k]; 
-	if(check_int(ctx, pkey,out)) 
+        pkey = hduptr->kwds[k];
+	if(check_int(ctx, pkey,out))
 	    hduptr->gcount = (int) strtol(pkey->kvalue,NULL,10);
         if( pkey->kindex != 5 + hduptr->naxis ) {
-	     sprintf(ctx->errmes,"GCOUNT is not in record %d of the header.",
-                 hduptr->naxis + 5); 
-             wrterr(ctx, out,ctx->errmes,1);
+	     snprintf(ctx->errmes, sizeof(ctx->errmes),"GCOUNT is not in record %d of the header.",
+                 hduptr->naxis + 5);
+             FV_HINT_SET_KEYWORD(ctx, "GCOUNT");
+             wrterr(ctx, out,ctx->errmes,1, FV_ERR_KEYWORD_ORDER);
         } 
 
         check_fixed_int(ctx, ctx->cards[pkey->kindex - 1], out);
@@ -1288,11 +1659,12 @@ void test_ext(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
     	key_match(ctx->tmpkwds,numusrkey,&ctx->ptemp,1,&k,&n);  
     	if(k > -1) {
             pkey = hduptr->kwds[k];
-            sprintf( ctx->errmes, 
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
                "Keyword #%d, %s is not allowed in extensions.",
                pkey->kindex,pkey->kname);
-            wrterr(ctx, out,ctx->errmes,1);
-        } 
+            FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_PRIMARY_KEY_IN_EXT);
+        }
     }
 
     for (i = 0; i < nexlnkey; i++) {
@@ -1307,12 +1679,13 @@ void test_ext(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
             if(!isdigit((int)*p)) continue;
 
             pkey = hduptr->kwds[j];
-            sprintf( ctx->errmes, 
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
                "Keyword #%d, %s is only allowed in Random Groups structures.",
                pkey->kindex,pkey->kname);
-            wrterr(ctx, out,ctx->errmes,1);
+            FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_KEYWORD_NOT_ALLOWED);
           }
-        } 
+        }
     }
 
     return;
@@ -1337,15 +1710,17 @@ void test_img_ext(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
        checked in CFITSIO */
 
     if(hduptr->pcount != 0 && hduptr->pcount != -99){
-        sprintf(ctx->errmes,
+        snprintf(ctx->errmes, sizeof(ctx->errmes),
            "Illegal pcount value %ld for image ext.",(long) hduptr->pcount);
-        wrterr(ctx, out,ctx->errmes,1);
+        FV_HINT_SET_KEYWORD(ctx, "PCOUNT");
+        wrterr(ctx, out,ctx->errmes,1, FV_ERR_KEYWORD_VALUE);
     }
 
     if(hduptr->gcount !=1 && hduptr->gcount != -99){
-        sprintf(ctx->errmes,
+        snprintf(ctx->errmes, sizeof(ctx->errmes),
            "Illegal gcount value %d for image ext.",hduptr->gcount);
-        wrterr(ctx, out,ctx->errmes,1);
+        FV_HINT_SET_KEYWORD(ctx, "GCOUNT");
+        wrterr(ctx, out,ctx->errmes,1, FV_ERR_KEYWORD_VALUE);
     }
 
     test_array(ctx, infits, out, hduptr);
@@ -1382,8 +1757,9 @@ void test_array(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
     char *exlnkeys[] = {"TBCOL", "TFORM",
                       "TSCAL", "TZERO","TNULL",
                       "TTYPE", "TUNIT","TDISP","TDIM",
-                      "TCTYP","TCUNI","TCRVL","TCDLT","TCRPX","TCROT"}; 
-    int nexlnkeys = 15;
+                      "TCTYP","TCUNI","TCRVL","TCDLT","TCRPX","TCROT",
+                      "TLMIN","TLMAX","TDMIN","TDMAX"};
+    int nexlnkeys = 19;
     
     /* non-indexed floating keywords  (excluding BSCALE) */
     char *fltkeys[] = {"BZERO","DATAMAX","DATAMIN"};
@@ -1402,11 +1778,12 @@ void test_array(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
     key_match(ctx->tmpkwds,numusrkey,&ctx->ptemp,1,&k,&n);  
     if( k >= 0) {
 	check_int(ctx, kwds[k],out);
-        if(hduptr->bitpix < 0) { 
-            sprintf(ctx->errmes,
+        if(hduptr->bitpix < 0) {
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
           "Keyword #%d, %s must not be used with floating point data (BITPIX = %d).",
-               kwds[k]->kindex,kwds[k]->kname, hduptr->bitpix); 
-            wrterr(ctx, out,ctx->errmes,2);
+               kwds[k]->kindex,kwds[k]->kname, hduptr->bitpix);
+            FV_HINT_SET_KEYWORD(ctx, "BLANK");
+            wrterr(ctx, out,ctx->errmes,2, FV_ERR_BLANK_WRONG_TYPE);
         } 
     }
 
@@ -1414,10 +1791,11 @@ void test_array(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
     ctx->ptemp = temp;
     key_match(ctx->tmpkwds,numusrkey,&ctx->ptemp,1,&k,&n);  
     if( k >= 0) {
-	if(check_flt(ctx, kwds[k],out) && strtod(kwds[k]->kvalue,NULL) == 0.0) { 
-                sprintf(ctx->errmes,"Keyword #%d, %s: The scaling factor is 0.",
+	if(check_flt(ctx, kwds[k],out) && strtod(kwds[k]->kvalue,NULL) == 0.0) {
+                snprintf(ctx->errmes, sizeof(ctx->errmes),"Keyword #%d, %s: The scaling factor is 0.",
                 kwds[k]->kindex,kwds[k]->kname);
-                wrtwrn(ctx, out,ctx->errmes,0); 
+                FV_HINT_SET_KEYWORD(ctx, "BSCALE");
+                wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_ZERO_SCALE);
         } 
     }
 
@@ -1429,11 +1807,12 @@ void test_array(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
         if(k < 0) continue;
         for (j = k; j < k+n; j++) { 
             pkey = hduptr->kwds[j];
-            sprintf( ctx->errmes, 
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
                "Keyword #%d, %s is not allowed in the array HDU.",
                pkey->kindex,pkey->kname);
-            wrterr(ctx, out,ctx->errmes,1);
-        } 
+            FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_IMAGE_KEY_IN_TABLE);
+        }
     }
 
     /* search for excluded, indexed keywords */
@@ -1449,11 +1828,12 @@ void test_array(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
 	    p += strlen(temp);
             if(!isdigit((int)*p)) continue;
 
-            sprintf( ctx->errmes, 
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
                "Keyword #%d, %s is not allowed in the array HDU.",
                pkey->kindex,pkey->kname);
-            wrterr(ctx, out,ctx->errmes,1);
-        } 
+            FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_IMAGE_KEY_IN_TABLE);
+        }
     }
 
     /* test datatype of reserved non-indexed floating point keywords */
@@ -1515,9 +1895,9 @@ void test_img_wcs(fitsfile *infits,
     /* Read in the FITS header, excluding COMMENT and HISTORY keyrecords. */
 /*
     if (fits_hdr2str(infits, 1, NULL, 0, &header, &nkeyrec, &status)) {
-        sprintf(ctx->errmes,
+        snprintf(ctx->errmes, sizeof(ctx->errmes),
            "test_img_ext failed to read header keywords into array %d", status);
-        wrterr(ctx, out,ctx->errmes,1);
+        wrterr(ctx, out,ctx->errmes,1, FV_ERR_CFITSIO);
 	return;
     }
 */
@@ -1526,9 +1906,9 @@ void test_img_wcs(fitsfile *infits,
 /*
     if ((status = wcsbth(header, nkeyrec, WCSHDR_all, -2, 0, 0, &nreject, &nwcs,
                        &wcs))) {
-        sprintf(ctx->errmes,
+        snprintf(ctx->errmes, sizeof(ctx->errmes),
            "test_img_ext: wcsbth ERROR %d: %s.", status, wcshdr_errmsg[status]);
-        wrterr(ctx, out,ctx->errmes,1);
+        wrterr(ctx, out,ctx->errmes,1, FV_ERR_CFITSIO);
 
         free(header);
 	return;
@@ -1538,13 +1918,13 @@ void test_img_wcs(fitsfile *infits,
 
     if (wcs) {
         if (nwcs == 1) {
-           sprintf(ctx->errmes,
+           snprintf(ctx->errmes, sizeof(ctx->errmes),
                " Found 1 World Coordinate System (WCS).");
         } else {
-           sprintf(ctx->errmes,
+           snprintf(ctx->errmes, sizeof(ctx->errmes),
                " Found %d World Coordinate Systems (WCS).", nwcs);
         }
-        wrtout(out,ctx->errmes);
+        wrtout(ctx, out,ctx->errmes);
     }
 */
     /* Translate non-standard WCS keyvalues and look for inconsistencies */
@@ -1555,18 +1935,18 @@ void test_img_wcs(fitsfile *infits,
     if ((status = wcsfix(7, 0, wcs, stat))) {
       for (ii = 0; ii < NWCSFIX; ii++) {
         if (stat[ii] > 0) {
-           sprintf(ctx->errmes, "wcsfix ERROR %d: %s.", stat[ii],
+           snprintf(ctx->errmes, sizeof(ctx->errmes), "wcsfix ERROR %d: %s.", stat[ii],
                    wcsfix_errmsg[stat[ii]]);
-           wrtwrn(ctx, out,ctx->errmes,0);
+           wrtwrn(ctx, out,ctx->errmes,0, FV_OK);
 
         }
       }
     }
 
     if ((status = wcsset(wcs))) {
-      sprintf(ctx->errmes,
+      snprintf(ctx->errmes, sizeof(ctx->errmes),
          "wcsset ERROR %d %s.", status, wcs_errmsg[status]);
-      wrtwrn(ctx, out,ctx->errmes,0);
+      wrtwrn(ctx, out,ctx->errmes,0, FV_OK);
     }
 */
 
@@ -1608,8 +1988,9 @@ void test_tbl(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
     int nexlkey = 6;
  
     /* floating WCS keywords  */
-    char *cfltkeys[] = {"TCRVL","TCDLT","TCRPX","TCROT" };
-    int ncfltkeys = 4;  
+    char *cfltkeys[] = {"TCRVL","TCDLT","TCRPX","TCROT",
+                        "TLMIN","TLMAX","TDMIN","TDMAX" };
+    int ncfltkeys = 8;
 
     /* string WCS keywords  */
     char *cstrkeys[] = {"TCTYP","TCUNI" };
@@ -1655,11 +2036,12 @@ void test_tbl(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
             ctx->ttype[i] = pkey->kvalue;
         } 
         else { 
-            sprintf(ctx->errmes,
-      "Keyword #%d, %s: invalid index %d (> TFIELD = %d).", 
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
+      "Keyword #%d, %s: invalid index %d (> TFIELD = %d).",
             pkey->kindex,pkey->kname,i+1,mcol);
-            wrterr(ctx, out,ctx->errmes,2);
-        }     
+            FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+            wrterr(ctx, out,ctx->errmes,2, FV_ERR_INDEX_EXCEEDS_TFIELDS);
+        }
     }
 
     strcpy(temp,"TFORM");
@@ -1678,32 +2060,35 @@ void test_tbl(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
 */
 
         if(*(pkey->kvalue) == ' ') {
-            sprintf(ctx->errmes,"Keyword #%d, %s: TFORM=\"%s\" ",
+            snprintf(ctx->errmes, sizeof(ctx->errmes),"Keyword #%d, %s: TFORM=\"%s\" ",
             pkey->kindex,pkey->kname, pkey->kvalue);
             strcat(ctx->errmes,
                 "should not have leading space.");
-            wrterr(ctx, out,ctx->errmes,1);
+            FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_LEADING_SPACE);
         }
 
         i = (int) strtol(p,NULL,10) -1 ;
         if(i>= 0 && i < mcol) {
             ctx->tform[i] = pkey->kvalue;
-        } 
-        else { 
-            sprintf(ctx->errmes,
-      "Keyword #%d, %s: invalid index %d (> TFIELD = %d).", 
+        }
+        else {
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
+      "Keyword #%d, %s: invalid index %d (> TFIELD = %d).",
             pkey->kindex,pkey->kname,i+1,mcol);
-            wrterr(ctx, out,ctx->errmes,2);
+            FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+            wrterr(ctx, out,ctx->errmes,2, FV_ERR_INDEX_EXCEEDS_TFIELDS);
         }
 
         p = pkey->kvalue;
-        while(*p != ' ' && *p != '\0') { 
+        while(*p != ' ' && *p != '\0') {
             if( !isdigit((int)*p) && !isupper((int)*p) && *p != '.' && *p != ')'
-                && *p != '(' ) { 
-                sprintf(ctx->errmes,
+                && *p != '(' ) {
+                snprintf(ctx->errmes, sizeof(ctx->errmes),
 "Keyword #%d, %s: The value %s has character %c which is not uppercase letter.",
                 pkey->kindex,pkey->kname,pkey->kvalue,*p);
-                wrterr(ctx, out,ctx->errmes,1);
+                FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+                wrterr(ctx, out,ctx->errmes,1, FV_ERR_BAD_TFORM);
             }
 
             p++;            
@@ -1725,13 +2110,14 @@ void test_tbl(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
             ctx->tunit[i] = pkey->kvalue;
         } 
         else { 
-            sprintf(ctx->errmes,
-      "Keyword #%d, %s: invalid index %d (> TFIELD = %d).", 
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
+      "Keyword #%d, %s: invalid index %d (> TFIELD = %d).",
             pkey->kindex,pkey->kname,i+1,mcol);
-            wrterr(ctx, out,ctx->errmes,1);
-        }     
+            FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_INDEX_EXCEEDS_TFIELDS);
+        }
     }
-   
+
     /*  Check TDISPn keywords */ 
     strcpy(temp,"TDISP");
     ctx->ptemp = temp;
@@ -1743,58 +2129,65 @@ void test_tbl(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
 
         if (*(kwds[j]->kvalue) == '\0') continue;  /* ignore blank string */
 	check_str(ctx, kwds[j],out);
-        if(*(kwds[j]->kvalue) == ' ') { 
-            sprintf(ctx->errmes,"Keyword #%d, %s: TDISP=\"%s\" ", 
-                kwds[j]->kindex,kwds[j]->kname,kwds[j]->kvalue); 
+        if(*(kwds[j]->kvalue) == ' ') {
+            snprintf(ctx->errmes, sizeof(ctx->errmes),"Keyword #%d, %s: TDISP=\"%s\" ",
+                kwds[j]->kindex,kwds[j]->kname,kwds[j]->kvalue);
             strcat(ctx->errmes,
                     "should not have leading space.");
-            wrterr(ctx, out,ctx->errmes,1); 
+            FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_LEADING_SPACE);
         }
 
 
 	i = (int) strtol(p,NULL,10) -1 ; 
         if(i< 0 || i >= mcol ) {
-            sprintf(ctx->errmes,
-      "Keyword #%d, %s: invalid index %d (> TFIELD = %d).", 
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
+      "Keyword #%d, %s: invalid index %d (> TFIELD = %d).",
             kwds[j]->kindex,kwds[j]->kname,i+1,mcol);
-            wrterr(ctx, out,ctx->errmes,1);
+            FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_INDEX_EXCEEDS_TFIELDS);
             continue;
-        }     
+        }
         p = kwds[j]->kvalue;
-        switch (*p) { 
+        FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+        switch (*p) {
             case 'A':
                  p++;
 		 w = 0;
-                 w = strtol(p,NULL,10); 
+                 w = strtol(p,NULL,10);
                  if( !w || w == LONG_MAX || w == LONG_MIN) {
-                     sprintf(ctx->errmes,
-                       "Keyword #%d, %s: invalid format \"%s\".", 
-                       kwds[j]->kindex,kwds[j]->kname, kwds[j]->kvalue); 
-                     wrterr(ctx, out,ctx->errmes,1); 
-                 } 
-                 if(strchr(ctx->tform[i],'A') == NULL ){  
-                     sprintf(ctx->errmes,
+                     snprintf(ctx->errmes, sizeof(ctx->errmes),
+                       "Keyword #%d, %s: invalid format \"%s\".",
+                       kwds[j]->kindex,kwds[j]->kname, kwds[j]->kvalue);
+                     wrterr(ctx, out,ctx->errmes,1, FV_ERR_BAD_TDISP);
+                 }
+                 if(strchr(ctx->tform[i],'A') == NULL ){
+                     snprintf(ctx->errmes, sizeof(ctx->errmes),
         "Keyword #%d, %s:  Format \"%s\" cannot be used for TFORM \"%s\".",
-        kwds[j]->kindex,kwds[j]->kname, kwds[j]->kvalue, ctx->tform[i]); 
-                     wrterr(ctx, out,ctx->errmes,1); 
-                 } 
+        kwds[j]->kindex,kwds[j]->kname, kwds[j]->kvalue, ctx->tform[i]);
+                     tdisp_mismatch_hints(ctx, infits, i+1,
+                         kwds[j]->kvalue, ctx->tform[i], kwds[j]->kname);
+                     wrterr(ctx, out,ctx->errmes,1, FV_ERR_BAD_TDISP);
+                 }
                  break;
             case 'L':
                  p++;
 		 w = 0;
                  w = strtol(p,NULL,10); 
                  if(!w || w == LONG_MAX || w == LONG_MIN) {
-                     sprintf(ctx->errmes,
-                       "Keyword #%d, %s: invalid format \"%s\".", 
-                       kwds[j]->kindex,kwds[j]->kname, kwds[j]->kvalue); 
-                     wrterr(ctx, out,ctx->errmes,1); 
-                 } 
-                 if(strchr(ctx->tform[i],'L') == NULL ){  
-                     sprintf(ctx->errmes,
+                     snprintf(ctx->errmes, sizeof(ctx->errmes),
+                       "Keyword #%d, %s: invalid format \"%s\".",
+                       kwds[j]->kindex,kwds[j]->kname, kwds[j]->kvalue);
+                     wrterr(ctx, out,ctx->errmes,1, FV_ERR_BAD_TDISP);
+                 }
+                 if(strchr(ctx->tform[i],'L') == NULL ){
+                     snprintf(ctx->errmes, sizeof(ctx->errmes),
         "Keyword #%d, %s:  Format %s cannot be used for TFORM \"%s\".",
-        kwds[j]->kindex,kwds[j]->kname, kwds[j]->kvalue, ctx->tform[i]); 
-                     wrterr(ctx, out,ctx->errmes,1); 
-                 } 
+        kwds[j]->kindex,kwds[j]->kname, kwds[j]->kvalue, ctx->tform[i]);
+                     tdisp_mismatch_hints(ctx, infits, i+1,
+                         kwds[j]->kvalue, ctx->tform[i], kwds[j]->kname);
+                     wrterr(ctx, out,ctx->errmes,1, FV_ERR_BAD_TDISP);
+                 }
                  break;
             case 'I': case 'B': case 'O': case 'Z':
                  p++;
@@ -1810,23 +2203,25 @@ void test_tbl(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
                  }
                  if(!w || w == LONG_MAX || w == LONG_MIN  || 
                     lm == LONG_MAX || lm == LONG_MIN  || w < lm ) {
-                     sprintf(ctx->errmes,
-                       "Keyword #%d, %s: invalid format \"%s\".", 
-                       kwds[j]->kindex,kwds[j]->kname, kwds[j]->kvalue); 
-                     wrterr(ctx, out,ctx->errmes,1); 
-                 } 
-                 if(strchr(ctx->tform[i],'I') == NULL &&  
-                    strchr(ctx->tform[i],'J') == NULL &&  
-                    strchr(ctx->tform[i],'K') == NULL &&  
-                    strchr(ctx->tform[i],'B') == NULL &&  
-                    strchr(ctx->tform[i],'X') == NULL   ){ 
-                     sprintf(ctx->errmes,
+                     snprintf(ctx->errmes, sizeof(ctx->errmes),
+                       "Keyword #%d, %s: invalid format \"%s\".",
+                       kwds[j]->kindex,kwds[j]->kname, kwds[j]->kvalue);
+                     wrterr(ctx, out,ctx->errmes,1, FV_ERR_BAD_TDISP);
+                 }
+                 if(strchr(ctx->tform[i],'I') == NULL &&
+                    strchr(ctx->tform[i],'J') == NULL &&
+                    strchr(ctx->tform[i],'K') == NULL &&
+                    strchr(ctx->tform[i],'B') == NULL &&
+                    strchr(ctx->tform[i],'X') == NULL   ){
+                     snprintf(ctx->errmes, sizeof(ctx->errmes),
         "Keyword #%d, %s:  Format \"%s\" cannot be used for TFORM \"%s\".",
-        kwds[j]->kindex,kwds[j]->kname, kwds[j]->kvalue, ctx->tform[i]); 
-                     wrterr(ctx, out,ctx->errmes,1); 
-                 } 
+        kwds[j]->kindex,kwds[j]->kname, kwds[j]->kvalue, ctx->tform[i]);
+                     tdisp_mismatch_hints(ctx, infits, i+1,
+                         kwds[j]->kvalue, ctx->tform[i], kwds[j]->kname);
+                     wrterr(ctx, out,ctx->errmes,1, FV_ERR_BAD_TDISP);
+                 }
                  break;
-            case 'F': 
+            case 'F':
                  p++;
 		 d = -1;
 		 w = 0;
@@ -1838,29 +2233,31 @@ void test_tbl(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
                  } 
                  if(!w || w == LONG_MAX || w == LONG_MIN  || 
                     d == -1 || d == LONG_MAX || d == LONG_MIN  || w < d+1 ) {
-                     sprintf(ctx->errmes,
-                       "Keyword #%d, %s: invalid format \"%s\".", 
-                       kwds[j]->kindex,kwds[j]->kname, kwds[j]->kvalue); 
-                     wrterr(ctx, out,ctx->errmes,1); 
-                 } 
-                 if(strchr(ctx->tform[i],'E') == NULL &&  
-                    strchr(ctx->tform[i],'F') == NULL &&  
-                    strchr(ctx->tform[i],'C') == NULL &&   
-                    strchr(ctx->tform[i],'D') == NULL &&  
-                    strchr(ctx->tform[i],'M') == NULL &&   
-                    strchr(ctx->tform[i],'I') == NULL &&  
-                    strchr(ctx->tform[i],'J') == NULL &&  
-                    strchr(ctx->tform[i],'K') == NULL &&  
-                    strchr(ctx->tform[i],'B') == NULL &&  
-                    strchr(ctx->tform[i],'X') == NULL  ){ 
-                     sprintf(ctx->errmes,
+                     snprintf(ctx->errmes, sizeof(ctx->errmes),
+                       "Keyword #%d, %s: invalid format \"%s\".",
+                       kwds[j]->kindex,kwds[j]->kname, kwds[j]->kvalue);
+                     wrterr(ctx, out,ctx->errmes,1, FV_ERR_BAD_TDISP);
+                 }
+                 if(strchr(ctx->tform[i],'E') == NULL &&
+                    strchr(ctx->tform[i],'F') == NULL &&
+                    strchr(ctx->tform[i],'C') == NULL &&
+                    strchr(ctx->tform[i],'D') == NULL &&
+                    strchr(ctx->tform[i],'M') == NULL &&
+                    strchr(ctx->tform[i],'I') == NULL &&
+                    strchr(ctx->tform[i],'J') == NULL &&
+                    strchr(ctx->tform[i],'K') == NULL &&
+                    strchr(ctx->tform[i],'B') == NULL &&
+                    strchr(ctx->tform[i],'X') == NULL  ){
+                     snprintf(ctx->errmes, sizeof(ctx->errmes),
         "Keyword #%d, %s:  Format \"%s\" cannot be used for TFORM \"%s\".",
-        kwds[j]->kindex,kwds[j]->kname, kwds[j]->kvalue, ctx->tform[i]); 
-                     wrterr(ctx, out,ctx->errmes,1); 
-                 } 
-                 break; 
+        kwds[j]->kindex,kwds[j]->kname, kwds[j]->kvalue, ctx->tform[i]);
+                     tdisp_mismatch_hints(ctx, infits, i+1,
+                         kwds[j]->kvalue, ctx->tform[i], kwds[j]->kname);
+                     wrterr(ctx, out,ctx->errmes,1, FV_ERR_BAD_TDISP);
+                 }
+                 break;
             case 'E': case 'D':
-                 p++; 
+                 p++;
 		 w = 0;
                  e = 0;
 		 d = 0;
@@ -1883,28 +2280,30 @@ void test_tbl(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
                     !d || d == LONG_MAX || d == LONG_MIN  || 
                     !e || e == LONG_MAX || e == LONG_MIN  || 
                     w < d+e+3) {
-                     sprintf(ctx->errmes,
-                       "Keyword #%d, %s: invalid format \"%s\".", 
-                       kwds[j]->kindex,kwds[j]->kname, kwds[j]->kvalue); 
-                     wrterr(ctx, out,ctx->errmes,1); 
-                 } 
-                 if(strchr(ctx->tform[i],'E') == NULL &&  
-                    strchr(ctx->tform[i],'F') == NULL &&  
-                    strchr(ctx->tform[i],'C') == NULL &&   
-                    strchr(ctx->tform[i],'D') == NULL &&  
-                    strchr(ctx->tform[i],'M') == NULL &&   
-                    strchr(ctx->tform[i],'I') == NULL &&  
-                    strchr(ctx->tform[i],'J') == NULL &&  
-                    strchr(ctx->tform[i],'K') == NULL &&  
-                    strchr(ctx->tform[i],'B') == NULL &&  
-                    strchr(ctx->tform[i],'X') == NULL  ){ 
-                     sprintf(ctx->errmes,
+                     snprintf(ctx->errmes, sizeof(ctx->errmes),
+                       "Keyword #%d, %s: invalid format \"%s\".",
+                       kwds[j]->kindex,kwds[j]->kname, kwds[j]->kvalue);
+                     wrterr(ctx, out,ctx->errmes,1, FV_ERR_BAD_TDISP);
+                 }
+                 if(strchr(ctx->tform[i],'E') == NULL &&
+                    strchr(ctx->tform[i],'F') == NULL &&
+                    strchr(ctx->tform[i],'C') == NULL &&
+                    strchr(ctx->tform[i],'D') == NULL &&
+                    strchr(ctx->tform[i],'M') == NULL &&
+                    strchr(ctx->tform[i],'I') == NULL &&
+                    strchr(ctx->tform[i],'J') == NULL &&
+                    strchr(ctx->tform[i],'K') == NULL &&
+                    strchr(ctx->tform[i],'B') == NULL &&
+                    strchr(ctx->tform[i],'X') == NULL  ){
+                     snprintf(ctx->errmes, sizeof(ctx->errmes),
         "Keyword #%d, %s:  Format \"%s\" cannot be used for TFORM \"%s\".",
-        kwds[j]->kindex,kwds[j]->kname, kwds[j]->kvalue, ctx->tform[i]); 
-                     wrterr(ctx, out,ctx->errmes,1); 
-                 } 
-                 break; 
-            case 'G': 
+        kwds[j]->kindex,kwds[j]->kname, kwds[j]->kvalue, ctx->tform[i]);
+                     tdisp_mismatch_hints(ctx, infits, i+1,
+                         kwds[j]->kvalue, ctx->tform[i], kwds[j]->kname);
+                     wrterr(ctx, out,ctx->errmes,1, FV_ERR_BAD_TDISP);
+                 }
+                 break;
+            case 'G':
                  p++; 
                  e = 0;
 		 d = 0;
@@ -1926,17 +2325,17 @@ void test_tbl(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
                  if(!w || w == LONG_MAX || w == LONG_MIN  || 
                     !d || d == LONG_MAX || d == LONG_MIN  || 
                     !e || e == LONG_MAX || e == LONG_MIN  ){ 
-                     sprintf(ctx->errmes,
-                       "Keyword #%d, %s: invalid format \"%s\".", 
-                       kwds[j]->kindex,kwds[j]->kname, kwds[j]->kvalue); 
-                     wrterr(ctx, out,ctx->errmes,1); 
-                 } 
-                 break; 
-             default: 
-                 sprintf(ctx->errmes,
-                   "Keyword #%d, %s: invalid format \"%s\".", 
-                   kwds[j]->kindex,kwds[j]->kname, kwds[j]->kvalue); 
-                 wrterr(ctx, out,ctx->errmes,1);
+                     snprintf(ctx->errmes, sizeof(ctx->errmes),
+                       "Keyword #%d, %s: invalid format \"%s\".",
+                       kwds[j]->kindex,kwds[j]->kname, kwds[j]->kvalue);
+                     wrterr(ctx, out,ctx->errmes,1, FV_ERR_BAD_TDISP);
+                 }
+                 break;
+             default:
+                 snprintf(ctx->errmes, sizeof(ctx->errmes),
+                   "Keyword #%d, %s: invalid format \"%s\".",
+                   kwds[j]->kindex,kwds[j]->kname, kwds[j]->kvalue);
+                 wrterr(ctx, out,ctx->errmes,1, FV_ERR_BAD_TDISP);
                  break; 
         }            
     }
@@ -1950,11 +2349,12 @@ OTHERKEY:
     	key_match(ctx->tmpkwds,numusrkey,&ctx->ptemp,1,&k,&n);  
     	if(k > -1) {
             pkey = hduptr->kwds[k];
-            sprintf( ctx->errmes, 
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
                "Keyword #%d, %s is not allowed in the Bin/ASCII table.",
                pkey->kindex,pkey->kname);
-            wrterr(ctx, out,ctx->errmes,1);
-        } 
+            FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_KEYWORD_NOT_ALLOWED);
+        }
       }
 
       /* search for excluded indexed keywords */
@@ -1972,11 +2372,11 @@ OTHERKEY:
 	    p += strlen(temp);
             if(!isdigit((int)*p)) continue;
 
-            sprintf( ctx->errmes, 
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
                "Keyword #%d, %s is not allowed in the Bin/ASCII table.",
                pkey->kindex,pkey->kname);
-            wrterr(ctx, out,ctx->errmes,1);
-        } 
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_KEYWORD_NOT_ALLOWED);
+        }
       }
 */
     }
@@ -1999,12 +2399,13 @@ OTHERKEY:
 
             m = (int)strtol(p,NULL,10);
             if (m < 1 || m > mcol) { 
-                sprintf( ctx->errmes, 
+                snprintf(ctx->errmes, sizeof(ctx->errmes),
             "Keyword #%d, %s: index %d is not in range 1-%d (TFIELD).",
                    pkey->kindex,pkey->kname,m,mcol);
-                   wrterr(ctx, out,ctx->errmes,1); 
+                   FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+                   wrterr(ctx, out,ctx->errmes,1, FV_ERR_INDEX_EXCEEDS_TFIELDS);
             }
-        } 
+        }
     }
 
     /* test datatype of reserved indexed string WCS keywords */
@@ -2025,20 +2426,21 @@ OTHERKEY:
 
             m = (int)strtol(p,NULL,10);
             if (m < 1 || m > mcol) { 
-                sprintf( ctx->errmes, 
+                snprintf(ctx->errmes, sizeof(ctx->errmes),
             "Keyword #%d, %s: index %d is not in range 1-%d (TFIELD).",
                    pkey->kindex,pkey->kname,m,mcol);
-                   wrterr(ctx, out,ctx->errmes,1); 
+                   FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+                   wrterr(ctx, out,ctx->errmes,1, FV_ERR_INDEX_EXCEEDS_TFIELDS);
             }
 
-        } 
+        }
     }
     return;
 }
 
 /*************************************************************
 *
-*      test_asc_ext 
+*      test_asc_ext
 *
 *   Test the ascii table extension header
 *
@@ -2085,10 +2487,11 @@ void test_asc_ext(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
 
         i = (int) strtol(p,NULL,10) ;
         if(i< 0 || i > mcol) {
-            sprintf(ctx->errmes,
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
       "Keyword #%d, %s: invalid index %d (> TFIELD = %d).",
             pkey->kindex,pkey->kname,i,mcol);
-            wrterr(ctx, out,ctx->errmes,1);
+            FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_INDEX_EXCEEDS_TFIELDS);
         }
         else {
             check_fixed_int(ctx, ctx->cards[pkey->kindex - 1], out);
@@ -2105,14 +2508,15 @@ void test_asc_ext(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
         if(!isdigit((int)*p)) continue;
         i = (int) strtol(p,NULL,10) -1;
         if(i< 0 || i >= mcol) {
-            sprintf(ctx->errmes,
-      "Keyword #%d, %s: invalid index %d (> TFIELD = %d).", 
-           kwds[j]->kindex,kwds[j]->kname,i+1,mcol); 
-            wrterr(ctx, out,ctx->errmes,1);
-        }     
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
+      "Keyword #%d, %s: invalid index %d (> TFIELD = %d).",
+           kwds[j]->kindex,kwds[j]->kname,i+1,mcol);
+            FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_INDEX_EXCEEDS_TFIELDS);
+        }
 	check_str(ctx, kwds[j],out);
-    } 
-    
+    }
+
     strcpy(temp,"TSCAL");
     ctx->ptemp = temp;
     key_match(ctx->tmpkwds,numusrkey,&ctx->ptemp,0,&k,&n);  
@@ -2122,26 +2526,29 @@ void test_asc_ext(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
         if(!isdigit((int)*p)) continue;
         i = (int) strtol(p,NULL,10) -1 ;
 	if(check_flt(ctx, kwds[j],out)){
-            if(strtod(kwds[j]->kvalue,NULL) == 0.0) { 
-                sprintf(ctx->errmes,"Keyword #%d, %s: Scaling factor is zero.",
+            if(strtod(kwds[j]->kvalue,NULL) == 0.0) {
+                snprintf(ctx->errmes, sizeof(ctx->errmes),"Keyword #%d, %s: Scaling factor is zero.",
                 kwds[j]->kindex,kwds[j]->kname);
-                wrtwrn(ctx, out,ctx->errmes,0);  
+                FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+                wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_ZERO_SCALE);
             }
         }
         if(i< 0 || i >= mcol) {
-            sprintf(ctx->errmes,
-      "Keyword #%d, %s: invalid index %d (> TFIELD = %d).", 
-            kwds[j]->kindex,kwds[j]->kname,i+1,mcol); 
-            wrterr(ctx, out,ctx->errmes,1);
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
+      "Keyword #%d, %s: invalid index %d (> TFIELD = %d).",
+            kwds[j]->kindex,kwds[j]->kname,i+1,mcol);
+            FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_INDEX_EXCEEDS_TFIELDS);
             continue;
-        }     
-        if(strchr(ctx->tform[i],'A') != NULL) { 
-            sprintf(ctx->errmes,
-              "Keyword #%d, %s may not be used for the A-format fields.", 
-            kwds[j]->kindex,kwds[j]->kname); 
-            wrterr(ctx, out,ctx->errmes,1); 
         }
-    } 
+        if(strchr(ctx->tform[i],'A') != NULL) {
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
+              "Keyword #%d, %s may not be used for the A-format fields.",
+            kwds[j]->kindex,kwds[j]->kname);
+            FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_TSCAL_WRONG_TYPE);
+        }
+    }
 
     strcpy(temp,"TZERO");
     ctx->ptemp = temp;
@@ -2153,19 +2560,21 @@ void test_asc_ext(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
 	check_flt(ctx, kwds[j],out);
 	i = (int) strtol(p,NULL,10) -1 ;
         if(i< 0 || i >= mcol) {
-            sprintf(ctx->errmes,
-      "Keyword #%d, %s: invalid index %d (> TFIELD = %d).", 
-            kwds[j]->kindex,kwds[j]->kname,i+1,mcol); 
-            wrterr(ctx, out,ctx->errmes,1);
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
+      "Keyword #%d, %s: invalid index %d (> TFIELD = %d).",
+            kwds[j]->kindex,kwds[j]->kname,i+1,mcol);
+            FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_INDEX_EXCEEDS_TFIELDS);
             continue;
-        }     
-        if(strchr(ctx->tform[i],'A') != NULL) { 
-            sprintf(ctx->errmes,
-              "Keyword #%d, %s may not be used for the A-format fields.", 
-            kwds[j]->kindex,kwds[j]->kname); 
-            wrterr(ctx, out,ctx->errmes,1); 
         }
-    } 
+        if(strchr(ctx->tform[i],'A') != NULL) {
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
+              "Keyword #%d, %s may not be used for the A-format fields.",
+            kwds[j]->kindex,kwds[j]->kname);
+            FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_TSCAL_WRONG_TYPE);
+        }
+    }
 
     strcpy(temp,"TDIM");
     ctx->ptemp = temp;
@@ -2176,24 +2585,26 @@ void test_asc_ext(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
         if(!isdigit((int)*p)) continue;
 
         pkey = hduptr->kwds[j];
-        sprintf( ctx->errmes, 
+        snprintf(ctx->errmes, sizeof(ctx->errmes),
            "Keyword #%d, %s is not allowed in the ASCII table.",
            pkey->kindex,pkey->kname);
-        wrterr(ctx, out,ctx->errmes,1);
-    } 
+        FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+        wrterr(ctx, out,ctx->errmes,1, FV_ERR_KEYWORD_NOT_ALLOWED);
+    }
 
     strcpy(temp,"THEAP");
     ctx->ptemp = temp;
     key_match(ctx->tmpkwds,numusrkey,&ctx->ptemp,1,&k,&n);  
     if (k > -1) {
         pkey = hduptr->kwds[k];
-        sprintf( ctx->errmes, 
+        snprintf(ctx->errmes, sizeof(ctx->errmes),
            "Keyword #%d, %s is not allowed in the ASCII table.",
            pkey->kindex,pkey->kname);
-        wrterr(ctx, out,ctx->errmes,1);
+        FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+        wrterr(ctx, out,ctx->errmes,1, FV_ERR_KEYWORD_NOT_ALLOWED);
     }
 
-    
+
     /* check whether the column name is unique  */
     test_colnam(ctx, out, hduptr);
     return ;
@@ -2255,38 +2666,42 @@ void test_bin_ext(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
 	check_int(ctx, kwds[j],out);
 	i = (int) strtol(p,NULL,10) -1 ;
         if(i< 0 || i >= mcol) {
-            sprintf(ctx->errmes,
-      "Keyword #%d, %s: invalid index %d (> TFIELD = %d).", 
-           kwds[j]->kindex,kwds[j]->kname,i+1,mcol); 
-            wrterr(ctx, out,ctx->errmes,1);
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
+      "Keyword #%d, %s: invalid index %d (> TFIELD = %d).",
+           kwds[j]->kindex,kwds[j]->kname,i+1,mcol);
+            FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_INDEX_EXCEEDS_TFIELDS);
             continue;
-        }     
-        if(strchr(ctx->tform[i],'B') == NULL &&  
-           strchr(ctx->tform[i],'I') == NULL &&  
-           strchr(ctx->tform[i],'J') == NULL &&  
-           strchr(ctx->tform[i],'K') == NULL ) { 
-            sprintf(ctx->errmes,
-     "Keyword #%d, %s is used for the column with format \"%s \".", 
-            kwds[j]->kindex,kwds[j]->kname,ctx->tform[i]); 
-            wrterr(ctx, out,ctx->errmes,2); 
-        } 
-        l = strtol(kwds[j]->kvalue,NULL,10); 
+        }
+        if(strchr(ctx->tform[i],'B') == NULL &&
+           strchr(ctx->tform[i],'I') == NULL &&
+           strchr(ctx->tform[i],'J') == NULL &&
+           strchr(ctx->tform[i],'K') == NULL ) {
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
+     "Keyword #%d, %s is used for the column with format \"%s \".",
+            kwds[j]->kindex,kwds[j]->kname,ctx->tform[i]);
+            FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+            wrterr(ctx, out,ctx->errmes,2, FV_ERR_TNULL_WRONG_TYPE);
+        }
+        l = strtol(kwds[j]->kvalue,NULL,10);
         if(strchr(ctx->tform[i],'B') != NULL && (
             l < 0 || l > 255) ) {
-            sprintf(ctx->errmes,"Keyword #%d, %s: The value %ld", 
-            kwds[j]->kindex,kwds[j]->kname, l); 
+            snprintf(ctx->errmes, sizeof(ctx->errmes),"Keyword #%d, %s: The value %ld",
+            kwds[j]->kindex,kwds[j]->kname, l);
             strcat(ctx->errmes, " is not in the range of datatype B.");
-            wrtwrn(ctx, out,ctx->errmes,0); 
+            FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+            wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_TNULL_RANGE);
         }
-        l = strtol(kwds[j]->kvalue,NULL,10); 
+        l = strtol(kwds[j]->kvalue,NULL,10);
         if(strchr(ctx->tform[i],'I') != NULL && (
             l < -32768 || l > 32767) ) {
-            sprintf(ctx->errmes,"Keyword #%d, %s: The value %ld", 
-            kwds[j]->kindex,kwds[j]->kname, l); 
+            snprintf(ctx->errmes, sizeof(ctx->errmes),"Keyword #%d, %s: The value %ld",
+            kwds[j]->kindex,kwds[j]->kname, l);
             strcat(ctx->errmes, " is not in the range of datatype I ");
-            wrtwrn(ctx, out,ctx->errmes,0); 
+            FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+            wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_TNULL_RANGE);
         }
-    } 
+    }
     
     /*  Check TSCALn keywords */ 
     strcpy(temp,"TSCAL");
@@ -2296,30 +2711,33 @@ void test_bin_ext(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
 	p = kwds[j]->kname; 
 	p += 5;
         if(!isdigit((int)*p)) continue;
-	if (check_flt(ctx, kwds[j],out) && strtod(kwds[j]->kvalue,NULL) == 0.0) { 
-            sprintf(ctx->errmes,"Keyword #%d, %s:",
+	if (check_flt(ctx, kwds[j],out) && strtod(kwds[j]->kvalue,NULL) == 0.0) {
+            snprintf(ctx->errmes, sizeof(ctx->errmes),"Keyword #%d, %s:",
             kwds[j]->kindex,kwds[j]->kname);
             strcat(ctx->errmes,
               "The scaling factor is zero.");
-            wrtwrn(ctx, out,ctx->errmes,0); 
+            FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+            wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_ZERO_SCALE);
         }
 	i = (int) strtol(p,NULL,10) -1 ;
         if(i< 0 || i >= mcol) {
-            sprintf(ctx->errmes,
-      "Keyword #%d, %s: invalid index %d (> TFIELD = %d).", 
-            kwds[j]->kindex,kwds[j]->kname,i+1,mcol); 
-            wrterr(ctx, out,ctx->errmes,1);
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
+      "Keyword #%d, %s: invalid index %d (> TFIELD = %d).",
+            kwds[j]->kindex,kwds[j]->kname,i+1,mcol);
+            FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_INDEX_EXCEEDS_TFIELDS);
             continue;
-        }     
-        if(strchr(ctx->tform[i],'A') != NULL ||  
-           strchr(ctx->tform[i],'L') != NULL ||  
-           strchr(ctx->tform[i],'X') != NULL ) { 
-            sprintf(ctx->errmes,
-         "Keyword #%d, %s is used in A, L, or X column. ",
-            kwds[j]->kindex,kwds[j]->kname); 
-            wrterr(ctx, out,ctx->errmes,1); 
         }
-    } 
+        if(strchr(ctx->tform[i],'A') != NULL ||
+           strchr(ctx->tform[i],'L') != NULL ||
+           strchr(ctx->tform[i],'X') != NULL ) {
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
+         "Keyword #%d, %s is used in A, L, or X column. ",
+            kwds[j]->kindex,kwds[j]->kname);
+            FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_TSCAL_WRONG_TYPE);
+        }
+    }
 
     /*  Check TZEROn keywords */ 
     strcpy(temp,"TZERO");
@@ -2332,21 +2750,23 @@ void test_bin_ext(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
 	check_flt(ctx, kwds[j],out);
 	i = (int) strtol(p,NULL,10) -1 ;
         if(i< 0 || i >= mcol) {
-            sprintf(ctx->errmes,
-      "Keyword #%d, %s: invalid index %d (> TFIELD = %d).", 
-            kwds[j]->kindex,kwds[j]->kname,i+1,mcol); 
-            wrterr(ctx, out,ctx->errmes,1);
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
+      "Keyword #%d, %s: invalid index %d (> TFIELD = %d).",
+            kwds[j]->kindex,kwds[j]->kname,i+1,mcol);
+            FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_INDEX_EXCEEDS_TFIELDS);
             continue;
-        }     
-        if(strchr(ctx->tform[i],'A') != NULL &&  
-           strchr(ctx->tform[i],'L') != NULL &&  
-           strchr(ctx->tform[i],'X') != NULL ) { 
-            sprintf(ctx->errmes,
-                "Keyword #%d, %s is used in A, L, or X column. ",
-            kwds[j]->kindex,kwds[j]->kname); 
-            wrterr(ctx, out,ctx->errmes,1); 
         }
-    } 
+        if(strchr(ctx->tform[i],'A') != NULL &&
+           strchr(ctx->tform[i],'L') != NULL &&
+           strchr(ctx->tform[i],'X') != NULL ) {
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
+                "Keyword #%d, %s is used in A, L, or X column. ",
+            kwds[j]->kindex,kwds[j]->kname);
+            FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_TSCAL_WRONG_TYPE);
+        }
+    }
 
     /* Check THEAP keyword */   
     hduptr->heap = (hduptr->naxes[0]) * (hduptr->naxes[1]);
@@ -2355,11 +2775,12 @@ void test_bin_ext(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
     if(k > -1) { 
          if(check_int(ctx, kwds[k],out))
              hduptr->heap = (int) strtol(hduptr->kwds[k]->kvalue,NULL,10);
-         if(!hduptr->pcount) { 
-            sprintf( ctx->errmes, 
+         if(!hduptr->pcount) {
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
                "Pcount is zero, but keyword THEAP is present at record #%d). ",
 	        kwds[k]->kindex);
-                wrterr(ctx, out,ctx->errmes,1); 
+                FV_HINT_SET_KEYWORD(ctx, "THEAP");
+                wrterr(ctx, out,ctx->errmes,1, FV_ERR_THEAP_NO_PCOUNT);
          }
     }
 
@@ -2368,8 +2789,8 @@ void test_bin_ext(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
     if(hduptr->pcount) {
         for (i=0; i< mcol; i++){ 
             if(fits_get_coltype(infits, i+1, &datatype, NULL, NULL, &status)){ 
-               sprintf(ctx->errmes,"Column #%d: ",i);
- 	       wrtferr(ctx, out,ctx->errmes, &status,2);
+               snprintf(ctx->errmes, sizeof(ctx->errmes),"Column #%d: ",i);
+ 	       wrtferr(ctx, out,ctx->errmes, &status,2, FV_ERR_CFITSIO);
             }
             if (datatype < 0) {
 	      vla = 1;
@@ -2378,10 +2799,11 @@ void test_bin_ext(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
 	}
 
 	if (vla == 0) {
-	    sprintf(ctx->errmes,
+	    snprintf(ctx->errmes, sizeof(ctx->errmes),
 	    "PCOUNT = %ld, but there are no variable-length array columns.",
 	   (long) hduptr->pcount);
-            wrtwrn(ctx, out,ctx->errmes,0);
+            FV_HINT_SET_KEYWORD(ctx, "PCOUNT");
+            wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_PCOUNT_NO_VLA);
 	} 
     }
       
@@ -2395,26 +2817,28 @@ void test_bin_ext(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
 	p += 4;
         if(!isdigit((int)*p)) continue;
 	check_str(ctx, kwds[j],out);
-        if(*(pkey->kvalue) == ' ') { 
-            sprintf(ctx->errmes,"Keyword #%d, %s: TDIM=\"%s\" ", 
-                pkey->kindex,pkey->kname,pkey->kvalue); 
+        if(*(pkey->kvalue) == ' ') {
+            snprintf(ctx->errmes, sizeof(ctx->errmes),"Keyword #%d, %s: TDIM=\"%s\" ",
+                pkey->kindex,pkey->kname,pkey->kvalue);
             strcat(ctx->errmes,
                     "should not have leading space.");
-            wrterr(ctx, out,ctx->errmes,1); 
+            FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_LEADING_SPACE);
             continue;
         }
 	i = (int) strtol(p,NULL,10) -1 ;
         if(i< 0 || i >= mcol) {
-            sprintf(ctx->errmes,
-      "Keyword #%d, %s: invalid index %d (> TFIELD = %d).", 
-            kwds[j]->kindex,kwds[j]->kname,i+1,mcol); 
-            wrterr(ctx, out,ctx->errmes,1);
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
+      "Keyword #%d, %s: invalid index %d (> TFIELD = %d).",
+            kwds[j]->kindex,kwds[j]->kname,i+1,mcol);
+            FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_INDEX_EXCEEDS_TFIELDS);
             continue;
-        }     
+        }
 	if(fits_decode_tdim(infits,pkey->kvalue,i+1,10,&ntdim,tdim, &status)){ 
-           sprintf(ctx->errmes,"Keyword #%d, %s: ", 
+           snprintf(ctx->errmes, sizeof(ctx->errmes),"Keyword #%d, %s: ", 
                 kwds[j]->kindex,kwds[j]->kname);
-	    wrtferr(ctx, out,ctx->errmes,&status,1);
+	    wrtferr(ctx, out,ctx->errmes,&status,1, FV_ERR_CFITSIO);
         } 
     } 
 
@@ -2426,10 +2850,12 @@ void test_bin_ext(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
 	if(!isdigit((int)*p))continue;
 	width = (int)strtol(p,NULL,10);
 	if(repeat%width != 0)  { 
-	    sprintf(ctx->errmes,
+	    snprintf(ctx->errmes, sizeof(ctx->errmes),
 	 "TFORM %s of column %d: repeat %d is not the multiple of the width %d",
 	    ctx->tform[i], i+1, repeat, width);
-            wrtwrn(ctx, out,ctx->errmes,0);
+            { char _kw[16]; snprintf(_kw, sizeof(_kw), "TFORM%d", i+1);
+              FV_HINT_SET_KEYWORD(ctx, _kw); }
+            wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_RAW_NOT_MULTIPLE);
         } 
     }
    
@@ -2445,11 +2871,12 @@ void test_bin_ext(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
 	    p += strlen(temp);
             if(!isdigit((int)*p)) continue;
 
-            sprintf( ctx->errmes, 
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
                "Keyword #%d, %s is not allowed in the Binary table.",
                pkey->kindex,pkey->kname);
-            wrterr(ctx, out,ctx->errmes,1);
-        } 
+            FV_HINT_SET_KEYWORD(ctx, pkey->kname);
+            wrterr(ctx, out,ctx->errmes,1, FV_ERR_KEYWORD_NOT_ALLOWED);
+        }
     }
     
     /* check whether the column name is unique */
@@ -2477,18 +2904,20 @@ void test_header(fv_context *ctx,
     int nmandkey = 5;
 
 
-    /* string keywords */ 
+    /* string keywords */
     char *strkey[] = {"EXTNAME", "ORIGIN", "AUTHOR","CREATOR","REFERENC","TELESCOP",
-        "INSTRUME", "OBSERVER", "OBJECT"}; 
-    int nstrkey = 9;
+        "INSTRUME", "OBSERVER", "OBJECT", "DATEREF", "TIMEUNIT"};
+    int nstrkey = 11;
 
     /* int keywords  */
     char *intkey[] = {"EXTVER", "EXTLEVEL"};
     int nintkey = 2;
 
     /* floating keywords  */
-    char *fltkey[] = {"EQUINOX", "MJD-OBS", "MJD-AVG"};
-    int nfltkey = 3;
+    char *fltkey[] = {"EQUINOX", "MJD-OBS", "MJD-AVG",
+        "MJDREF", "JDREF", "TSTART", "TSTOP",
+        "TIMSYER", "TIMRDER", "TIMEDEL", "TIMEOFFS"};
+    int nfltkey = 11;
 
     FitsKey** kwds;		/* FitsKey structure array */ 
     int numusrkey;
@@ -2518,11 +2947,12 @@ void test_header(fv_context *ctx,
 	 pp = &(mandkey[i]);
          key_match(ctx->tmpkwds,numusrkey,pp,1,&k,&n);
          if(k > -1) { 
-             for ( j = k; j < k + n; j++) { 
-                sprintf(ctx->errmes,
-      "Keyword #%d, %s is duplicated or out of order.", 
+             for ( j = k; j < k + n; j++) {
+                snprintf(ctx->errmes, sizeof(ctx->errmes),
+      "Keyword #%d, %s is duplicated or out of order.",
                 kwds[j]->kindex,kwds[j]->kname);
-             wrterr(ctx, out,ctx->errmes,1); 
+             FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+             wrterr(ctx, out,ctx->errmes,1, FV_ERR_KEYWORD_ORDER);
              }
          }
     } 
@@ -2536,16 +2966,18 @@ void test_header(fv_context *ctx,
         lv = strtol(pt,NULL,10); 
         if(lv > 0 ){
             if(kwds[j]->kindex != 3 + lv) {
-                sprintf(ctx->errmes,
-                "Keyword #%d, %s is duplicated or out of order.", 
+                snprintf(ctx->errmes, sizeof(ctx->errmes),
+                "Keyword #%d, %s is duplicated or out of order.",
                 kwds[j]->kindex,kwds[j]->kname);
-                wrterr(ctx, out,ctx->errmes,1);  
+                FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+                wrterr(ctx, out,ctx->errmes,1, FV_ERR_KEYWORD_ORDER);
             }
-            if(lv > hduptr->naxis) {      
-                sprintf(ctx->errmes,
-                  "Keyword #%d, %s is not allowed (with n > NAXIS =%d).", 
+            if(lv > hduptr->naxis) {
+                snprintf(ctx->errmes, sizeof(ctx->errmes),
+                  "Keyword #%d, %s is not allowed (with n > NAXIS =%d).",
                    kwds[j]->kindex,kwds[j]->kname,hduptr->naxis);
-                wrterr(ctx, out,ctx->errmes,1); 
+                FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+                wrterr(ctx, out,ctx->errmes,1, FV_ERR_KEYWORD_VALUE);
             }
         } 
     }
@@ -2555,10 +2987,11 @@ void test_header(fv_context *ctx,
     ctx->ptemp = temp;
     key_match(ctx->tmpkwds,numusrkey,&ctx->ptemp,1,&k,&n);
     if(k > -1) { 
-         sprintf(ctx->errmes,
-            "Keyword #%d, %s is deprecated. Use EQUINOX instead.", 
+         snprintf(ctx->errmes, sizeof(ctx->errmes),
+            "Keyword #%d, %s is deprecated. Use EQUINOX instead.",
              kwds[k]->kindex, kwds[k]->kname);
-         wrtwrn(ctx, out,ctx->errmes,0);
+         FV_HINT_SET_KEYWORD(ctx, kwds[k]->kname);
+         wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_DEPRECATED);
 	 check_flt(ctx, kwds[k],out);
     }
 
@@ -2569,19 +3002,46 @@ void test_header(fv_context *ctx,
     key_match(ctx->tmpkwds,numusrkey,&ctx->ptemp,0,&k,&n);  
     for (j = k; j< n + k ; j++){
        check_str(ctx, kwds[j],out);
-       if(fits_str2time(kwds[j]->kvalue, &yr, &mn, &dy, &hr, &min, 
-          &sec, &status)){ 
-           sprintf(ctx->errmes,"Keyword #%d, %s: ", kwds[j]->kindex,kwds[j]->kname);
-           wrtserr(ctx, out,ctx->errmes,&status,1);
-        } 
+       if(fits_str2time(kwds[j]->kvalue, &yr, &mn, &dy, &hr, &min,
+          &sec, &status)){
+           snprintf(ctx->errmes, sizeof(ctx->errmes),"Keyword #%d, %s: ", kwds[j]->kindex,kwds[j]->kname);
+           FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+           {
+               char iso_date[30];
+               if (try_convert_date(kwds[j]->kvalue, iso_date, sizeof(iso_date))) {
+                   FV_HINT_SET_FIX(ctx,
+                       "Found '%s' (C ctime format). Change %s in "
+                       "HDU %d to '%s' (ISO 8601).",
+                       kwds[j]->kvalue, kwds[j]->kname,
+                       ctx->curhdu, iso_date);
+                   FV_HINT_SET_EXPLAIN(ctx,
+                       "%s = '%s' uses C ctime format instead of ISO 8601. "
+                       "The FITS Standard requires 'YYYY-MM-DDThh:mm:ss' "
+                       "or 'YYYY-MM-DD'. See FITS Standard Section 4.4.2.1.",
+                       kwds[j]->kname, kwds[j]->kvalue);
+               } else {
+                   FV_HINT_SET_FIX(ctx,
+                       "Found '%s'. Change %s in HDU %d to ISO 8601 "
+                       "format ('YYYY-MM-DDThh:mm:ss' or 'YYYY-MM-DD').",
+                       kwds[j]->kvalue, kwds[j]->kname, ctx->curhdu);
+                   FV_HINT_SET_EXPLAIN(ctx,
+                       "The FITS Standard requires all DATExxxx keywords "
+                       "to use ISO 8601 format: 'YYYY-MM-DDThh:mm:ss"
+                       "[.sss...]' or 'YYYY-MM-DD'. "
+                       "See FITS Standard Section 4.4.2.1.");
+               }
+           }
+           wrtserr(ctx, out,ctx->errmes,&status,1, FV_ERR_CFITSIO_STACK);
+        }
         if( (pt = strchr(kwds[j]->kvalue,'/'))!=NULL) { 
                pt +=4;
                yy = (int) strtol(pt,NULL,10); 
                if(0 <= yy && yy <=10) {
-               sprintf(ctx->errmes,
+               snprintf(ctx->errmes, sizeof(ctx->errmes),
                   "Keyword #%d, %s %s intends to mean year 20%-2.2d?",
                    kwds[j]->kindex, kwds[j]->kname, kwds[j]->kvalue, yy);
-                   wrtwrn(ctx, out,ctx->errmes,0);
+                   FV_HINT_SET_KEYWORD(ctx, kwds[j]->kname);
+                   wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_Y2K);
 	       } 
         }
     }
@@ -2590,8 +3050,60 @@ void test_header(fv_context *ctx,
     for (i = 0; i < nstrkey; i++) {
         strcpy(temp,strkey[i]);
     	ctx->ptemp = temp;
-    	key_match(ctx->tmpkwds,numusrkey,&ctx->ptemp,1,&k,&n);  
+    	key_match(ctx->tmpkwds,numusrkey,&ctx->ptemp,1,&k,&n);
         if(k > -1) check_str(ctx, kwds[k],out);
+    }
+
+    /* Check the TIMESYS keyword (time scale, FITS 4.0 / WCS Paper IV) */
+    strcpy(temp,"TIMESYS");
+    ctx->ptemp = temp;
+    key_match(ctx->tmpkwds,numusrkey,&ctx->ptemp,1,&k,&n);
+    if(k > -1) {
+        if (check_str(ctx, kwds[k],out)) {
+            static const char *timesys_allowed[] = {
+                "UTC","TAI","TDB","TT","ET","UT1","UT",
+                "TCG","TCB","TDT","IAT","GPS","LOCAL",NULL
+            };
+            const char *val = kwds[k]->kvalue;
+            int exact_match = 0, case_match = -1;
+            for (int t = 0; timesys_allowed[t]; t++) {
+                if (!strcmp(val, timesys_allowed[t])) { exact_match = 1; break; }
+                if (case_match < 0 && !strcasecmp(val, timesys_allowed[t]))
+                    case_match = t;
+            }
+            if (!exact_match) {
+                snprintf(ctx->errmes, sizeof(ctx->errmes),
+                    "Keyword #%d, TIMESYS has non-allowed value: %s",
+                    kwds[k]->kindex, val);
+                FV_HINT_SET_KEYWORD(ctx, "TIMESYS");
+                if (case_match >= 0) {
+                    FV_HINT_SET_FIX(ctx,
+                        "Change TIMESYS from '%s' to '%s' in HDU %d. "
+                        "TIMESYS values must be uppercase.",
+                        val, timesys_allowed[case_match], ctx->curhdu);
+                    FV_HINT_SET_EXPLAIN(ctx,
+                        "TIMESYS specifies the time scale for time-related "
+                        "keywords. '%s' is recognized but must be written "
+                        "in uppercase as '%s'. Allowed values: UTC, TAI, "
+                        "TDB, TT, ET, UT1, UT, TCG, TCB, TDT, IAT, GPS, "
+                        "LOCAL. See FITS Standard Section 4.4.2.6.",
+                        val, timesys_allowed[case_match]);
+                } else {
+                    FV_HINT_SET_FIX(ctx,
+                        "Change TIMESYS from '%s' to a recognized time scale "
+                        "in HDU %d. Allowed values: UTC, TAI, TDB, TT, ET, "
+                        "UT1, UT, TCG, TCB, TDT, IAT, GPS, LOCAL.",
+                        val, ctx->curhdu);
+                    FV_HINT_SET_EXPLAIN(ctx,
+                        "TIMESYS specifies the time scale for time-related "
+                        "keywords (e.g., MJD-OBS, DATE-OBS). '%s' is not a "
+                        "recognized time scale. See FITS Standard Section "
+                        "4.4.2.6.",
+                        val);
+                }
+                wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_TIMESYS_VALUE);
+            }
+        }
     }
 
     /* Check the reserved int keywords */
@@ -2614,10 +3126,11 @@ void test_header(fv_context *ctx,
     for (i = 0; i < numusrkey-1; i++) { 
        if(!strcmp(ctx->tmpkwds[i],ctx->tmpkwds[i+1])) { 
           if (strcmp(kwds[i]->kname,"HIERARCH"))  {
-           sprintf(ctx->errmes,
-     "Keyword %s is duplicated in card #%d and card #%d.", 
+           snprintf(ctx->errmes, sizeof(ctx->errmes),
+     "Keyword %s is duplicated in card #%d and card #%d.",
             kwds[i]->kname, kwds[i]->kindex, kwds[i+1]->kindex);
-          wrtwrn(ctx, out,ctx->errmes,0);
+          FV_HINT_SET_KEYWORD(ctx, kwds[i]->kname);
+          wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_DUPLICATE_KEYWORD);
           }
        }
     }  
@@ -2628,9 +3141,10 @@ void test_header(fv_context *ctx,
         ctx->ptemp = temp;
         key_match(ctx->tmpkwds,numusrkey,&ctx->ptemp,1,&k,&n);
         if(k <= -1) {  
-            sprintf(ctx->errmes,
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
 "The OGIP long string keyword convention is used without the recommended LONGSTRN keyword. ");
-          wrtwrn(ctx, out,ctx->errmes,1);
+          FV_HINT_SET_KEYWORD(ctx, "LONGSTRN");
+          wrtwrn(ctx, out,ctx->errmes,1, FV_WARN_MISSING_LONGSTRN);
         }
     }
 
@@ -2645,10 +3159,11 @@ void test_header(fv_context *ctx,
 
         /* Must have a space character following "HIERARCH" */
 	if (*(ctx->cards[i] + 8) != ' ') {
-	       sprintf(ctx->errmes,
+	       snprintf(ctx->errmes, sizeof(ctx->errmes),
 "Keyword #%d: does not have a space character in byte 9:               %66s",
                i+1,ctx->cards[i]);
-	       wrterr(ctx, out,ctx->errmes,1);
+	       FV_HINT_SET_KEYWORD(ctx, "HIERARCH");
+	       wrterr(ctx, out,ctx->errmes,1, FV_ERR_ILLEGAL_NAME_CHAR);
         }
 
         /* Whether the characters in HIERARCH token names are valid */
@@ -2663,10 +3178,11 @@ void test_header(fv_context *ctx,
 	       (*pt < '0'  ||  *pt > '9')&& 
 	       (*pt != '-' &&  *pt  != '_' && *pt != ' ') ) { 
 
-	       sprintf(ctx->errmes,
+	       snprintf(ctx->errmes, sizeof(ctx->errmes),
 "Keyword #%d: token contains illegal char \"%c\" (only A-Z,0-9,-,_): %66s",
                i+1,*pt,ctx->cards[i]);
-	       wrterr(ctx, out,ctx->errmes,1);
+	       FV_HINT_SET_KEYWORD(ctx, "HIERARCH");
+	       wrterr(ctx, out,ctx->errmes,1, FV_ERR_ILLEGAL_NAME_CHAR);
 	       break;
             }
 
@@ -2674,10 +3190,11 @@ void test_header(fv_context *ctx,
         }
 	
 	if (*pt == '\0')  {  /* the "=" is not present on the card */
-	    sprintf(ctx->errmes,
+	    snprintf(ctx->errmes, sizeof(ctx->errmes),
 "Keyword #%d: does not contain the \"=\" value indicator char:      %66s",
             i+1, ctx->cards[i]);
-	    wrterr(ctx, out,ctx->errmes,1);
+	    FV_HINT_SET_KEYWORD(ctx, "HIERARCH");
+	    wrterr(ctx, out,ctx->errmes,1, FV_ERR_BAD_VALUE_FORMAT);
          } else if (*pt == '=') {
 
 	     /* now check that the keyword has a legal value */	     
@@ -2736,10 +3253,11 @@ void test_header(fv_context *ctx,
 		         while (*p1 == ' ') p1++;
 			 while (*p2 == ' ') p2++;
 		       } else if (*p1 == '=' ) { /* found '=' in both keywords */
-		       	 sprintf(ctx->errmes,
-"HIERARCH keyword name is duplicated in ctx->cards #%d and card #%d:   %66s", 
+		       	 snprintf(ctx->errmes, sizeof(ctx->errmes),
+"HIERARCH keyword name is duplicated in ctx->cards #%d and card #%d:   %66s",
                           i+1, ii+1, ctx->cards[i]);
-                          wrtwrn(ctx, out,ctx->errmes,0);
+                          FV_HINT_SET_KEYWORD(ctx, "HIERARCH");
+                          wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_HIERARCH_DUPLICATE);
 			  p1++;  /* do this to prevent duplicate warning message, below */
                           break;
 		       } else {
@@ -2756,10 +3274,11 @@ void test_header(fv_context *ctx,
 		     
 		     if (*p1 == '=' && *p2 == '=') {
 		       /* if we got here, then the names are the same except for non-significant spacing differences */
-		       sprintf(ctx->errmes,
-"HIERARCH keyword name is duplicated in ctx->cards #%d and card #%d:   %66s", 
+		       snprintf(ctx->errmes, sizeof(ctx->errmes),
+"HIERARCH keyword name is duplicated in ctx->cards #%d and card #%d:   %66s",
                        i+1, ii+1, ctx->cards[i]);
-                       wrtwrn(ctx, out,ctx->errmes,0);
+                       FV_HINT_SET_KEYWORD(ctx, "HIERARCH");
+                       wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_HIERARCH_DUPLICATE);
                        break;
 		     } else {
 		       /* these HIERARCH keywords do not have idential tokens */
@@ -2862,9 +3381,11 @@ void test_colnam(fv_context *ctx, FILE *out,
         p = ctx->ttype[i];
         q = ttypecopy[i];
         if(!strlen(p)) { 
-            sprintf(ctx->errmes,
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
             "Column #%d has no name (No TTYPE%d keyword).",i+1, i+1);
-            wrtwrn(ctx, out,ctx->errmes,0);
+            { char _kw[16]; snprintf(_kw, sizeof(_kw), "TTYPE%d", i+1);
+              FV_HINT_SET_KEYWORD(ctx, _kw); }
+            wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_NO_COLUMN_NAME);
             continue;
         }
 
@@ -2872,23 +3393,27 @@ void test_colnam(fv_context *ctx, FILE *out,
 /*      disable this check (it was only a warning) 
         if( (*p  > 'z' || *p < 'a') && (*p > 'Z' || *p <'A') 
                 && (*p > '9' || *p < '0') ) { 
-            sprintf(ctx->errmes,"Column #%d: Name \"%s\" does not begin with a letter or a digit.",i+1,ctx->ttype[i]);
-            wrtwrn(ctx, out,ctx->errmes,1);
+            snprintf(ctx->errmes, sizeof(ctx->errmes),"Column #%d: Name \"%s\" does not begin with a letter or a digit.",i+1,ctx->ttype[i]);
+            wrtwrn(ctx, out,ctx->errmes,1, FV_OK);
         }  
 */
         while(*p != '\0') {
             if ((*p > 'z' || *p < 'a') && (*p > 'Z' || *p < 'A')
                  && (*p > '9' || *p < '0') && (*p != '_')) {
                if (*p == '&') {
-                  sprintf(ctx->errmes,
+                  snprintf(ctx->errmes, sizeof(ctx->errmes),
                   "Column #%d: Reserved column name keyword (TTYPE%d) may use an illegal CONTINUE (\'%c\')",
                   i+1,i+1,*p);
-                  wrtwrn(ctx, out,ctx->errmes,0);
+                  { char _kw[16]; snprintf(_kw, sizeof(_kw), "TTYPE%d", i+1);
+                    FV_HINT_SET_KEYWORD(ctx, _kw); }
+                  wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_CONTINUE_CHAR);
                } else {
-                  sprintf(ctx->errmes,
+                  snprintf(ctx->errmes, sizeof(ctx->errmes),
                   "Column #%d: Name \"%s\" contains character \'%c\' other than letters, digits, and \"_\".",
                   i+1,ctx->ttype[i],*p);
-                  wrtwrn(ctx, out,ctx->errmes,0);
+                  { char _kw[16]; snprintf(_kw, sizeof(_kw), "TTYPE%d", i+1);
+                    FV_HINT_SET_KEYWORD(ctx, _kw); }
+                  wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_BAD_COLUMN_NAME);
                }
             }
             if(*p <= 'z' || *p >= 'a') *q = toupper(*p);
@@ -2912,20 +3437,21 @@ void test_colnam(fv_context *ctx, FILE *out,
 
 /*      disable this warning
         if(!strncmp(cols[i]->name,cols[i+1]->name,16)) { 
-            sprintf(ctx->errmes,
-     "Columns #%d, %s and #%d, %s are not unique within first 16 characters(case insensitive).", 
-            cols[i]->index,   ctx->ttype[(cols[i]->index-1)], 
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
+     "Columns #%d, %s and #%d, %s are not unique within first 16 characters(case insensitive).",
+            cols[i]->index,   ctx->ttype[(cols[i]->index-1)],
             cols[i+1]->index, ctx->ttype[(cols[i+1]->index-1)]);
-          wrtwrn(ctx, out,ctx->errmes,1);
+          wrtwrn(ctx, out,ctx->errmes,1, FV_OK);
         }
 */
 
         if(!strcmp(cols[i]->name,cols[i+1]->name)) { 
-            sprintf(ctx->errmes,
-     "Columns #%d, %s and #%d, %s are not unique (case insensitive).", 
-            cols[i]->index,   ctx->ttype[(cols[i]->index-1)], 
+            snprintf(ctx->errmes, sizeof(ctx->errmes),
+     "Columns #%d, %s and #%d, %s are not unique (case insensitive).",
+            cols[i]->index,   ctx->ttype[(cols[i]->index-1)],
             cols[i+1]->index, ctx->ttype[(cols[i+1]->index-1)]);
-          wrtwrn(ctx, out,ctx->errmes,0);
+          FV_HINT_SET_KEYWORD(ctx, "TTYPE");
+          wrtwrn(ctx, out,ctx->errmes,0, FV_WARN_DUPLICATE_COLUMN);
         }
     }  
     for (i = 0; i < n; i++) { free(cols[i]); free(ttypecopy[i]);}
@@ -2961,36 +3487,44 @@ void   parse_vtform(fv_context *ctx, fitsfile *infits,
     p = temp; 
 
     if(isdigit((int)*p)) sscanf(ctx->ptemp,"%d",&i); 
-    if(i > 1) { 
-        sprintf(ctx->errmes,"Illegal repeat value for value %s of TFORM%d.", 
+    if(i > 1) {
+        snprintf(ctx->errmes, sizeof(ctx->errmes),"Illegal repeat value for value %s of TFORM%d.",
 	   ctx->tform[colnum-1], colnum);
-        wrterr(ctx, out,ctx->errmes,1);
-    } 
+        { char _kw[16]; snprintf(_kw, sizeof(_kw), "TFORM%d", colnum);
+          FV_HINT_SET_KEYWORD(ctx, _kw); }
+        wrterr(ctx, out,ctx->errmes,1, FV_ERR_VAR_FORMAT);
+    }
     while(isdigit((int)*p))p++;
 
-    if( (*p != 'P') && (*p != 'Q') ) { 
-        sprintf(ctx->errmes,
-	  "TFORM%d is not for the variable length array: %s.", 
-        colnum, ctx->tform[colnum-1]); 
-        wrterr(ctx, out,ctx->errmes,1);
+    if( (*p != 'P') && (*p != 'Q') ) {
+        snprintf(ctx->errmes, sizeof(ctx->errmes),
+	  "TFORM%d is not for the variable length array: %s.",
+        colnum, ctx->tform[colnum-1]);
+        { char _kw[16]; snprintf(_kw, sizeof(_kw), "TFORM%d", colnum);
+          FV_HINT_SET_KEYWORD(ctx, _kw); }
+        wrterr(ctx, out,ctx->errmes,1, FV_ERR_VAR_FORMAT);
     }
     *isQFormat = (*p == 'Q') ? 1 : 0;
 
-    fits_get_coltype(infits,colnum, datacode, NULL, NULL, &status); 
+    fits_get_coltype(infits,colnum, datacode, NULL, NULL, &status);
     status = 0;
     p += 2;
     if(*p != '(') return;
-    p++; 
-    if(!isdigit((int)*p)) { 
-       sprintf(ctx->errmes, "Bad value of TFORM%d: %s.",colnum,ctx->tform[colnum-1]);
-       wrterr(ctx, out,ctx->errmes,1);
-    } 
+    p++;
+    if(!isdigit((int)*p)) {
+       snprintf(ctx->errmes, sizeof(ctx->errmes), "Bad value of TFORM%d: %s.",colnum,ctx->tform[colnum-1]);
+       { char _kw[16]; snprintf(_kw, sizeof(_kw), "TFORM%d", colnum);
+         FV_HINT_SET_KEYWORD(ctx, _kw); }
+       wrterr(ctx, out,ctx->errmes,1, FV_ERR_BAD_TFORM);
+    }
     sscanf(p,"%ld",maxlen);
     while(isdigit((int)*p))p++;
-    if(*p != ')') { 
-       sprintf(ctx->errmes, "Bad value of TFORM%d: %s.",colnum,ctx->tform[colnum-1]);
-       wrterr(ctx, out,ctx->errmes,1);
-    } 
+    if(*p != ')') {
+       snprintf(ctx->errmes, sizeof(ctx->errmes), "Bad value of TFORM%d: %s.",colnum,ctx->tform[colnum-1]);
+       { char _kw[16]; snprintf(_kw, sizeof(_kw), "TFORM%d", colnum);
+         FV_HINT_SET_KEYWORD(ctx, _kw); }
+       wrterr(ctx, out,ctx->errmes,1, FV_ERR_BAD_TFORM);
+    }
     return;
 }
 
@@ -3011,26 +3545,26 @@ void print_title(fv_context *ctx, FILE* out, int hdunum, int hdutype)
 
     if(ctx->oldhdu == ctx->curhdu) return; /* Do not print it twice */
     if(ctx->curhdu == 1){
-	        sprintf(ctx->hdutitle," HDU %d: Primary Array ", ctx->curhdu);
+	        snprintf(ctx->hdutitle, sizeof(ctx->hdutitle)," HDU %d: Primary Array ", ctx->curhdu);
     }
     else { 
         switch (ctx->curtype) { 
 	    case IMAGE_HDU:  
-		sprintf(ctx->hdutitle," HDU %d: Image Exten. ", ctx->curhdu);
+		snprintf(ctx->hdutitle, sizeof(ctx->hdutitle)," HDU %d: Image Exten. ", ctx->curhdu);
                 break;
 	    case ASCII_TBL:  
-		sprintf(ctx->hdutitle," HDU %d: ASCII Table ", ctx->curhdu);
+		snprintf(ctx->hdutitle, sizeof(ctx->hdutitle)," HDU %d: ASCII Table ", ctx->curhdu);
                 break;
 	    case BINARY_TBL:  
-		sprintf(ctx->hdutitle," HDU %d: BINARY Table ", ctx->curhdu);
+		snprintf(ctx->hdutitle, sizeof(ctx->hdutitle)," HDU %d: BINARY Table ", ctx->curhdu);
                 break;
             default: 
-		sprintf(ctx->hdutitle," HDU %d: Unknown Ext. ", ctx->curhdu);
+		snprintf(ctx->hdutitle, sizeof(ctx->hdutitle)," HDU %d: Unknown Ext. ", ctx->curhdu);
                 break;
         }
     } 
-    wrtsep(out,'=',ctx->hdutitle,60);
-    wrtout(out," ");
+    wrtsep(ctx, out,'=',ctx->hdutitle,60);
+    wrtout(ctx, out," ");
     ctx->oldhdu = ctx->curhdu;
     if(ctx->curhdu == ctx->totalhdu) ctx->oldhdu = 0;  /* reset the old hdu at the last hdu */
     return; 
@@ -3048,10 +3582,10 @@ void print_header(fv_context *ctx, FILE* out)
     char htemp[100];
     int i;
     for (i=1; i <= ctx->ncards; i++)  { 
-        sprintf(htemp,"%4d | %s",i,ctx->cards[i-1]);    	
-	wrtout(out, htemp);
+        snprintf(htemp, sizeof(htemp),"%4d | %s",i,ctx->cards[i-1]);    	
+	wrtout(ctx, out, htemp);
     }
-    wrtout(out," ");
+    wrtout(ctx, out," ");
     return; 
 }  
 
@@ -3079,81 +3613,87 @@ void print_summary(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
     set_hduerr(ctx, hduptr->hdunum);
 
     hdutype = hduptr->hdutype;
-    sprintf(ctx->comm," %d header keywords", hduptr->nkeys);
-    wrtout(out,ctx->comm);
-    wrtout(out," ");
+    snprintf(ctx->comm, sizeof(ctx->comm)," %d header keywords", hduptr->nkeys);
+    wrtout(ctx, out,ctx->comm);
+    wrtout(ctx, out," ");
     if(hdutype == ASCII_TBL || hdutype== BINARY_TBL) {  
-        sprintf(extnv, "%s",hduptr->extname);
+        snprintf(extnv, sizeof(extnv), "%s",hduptr->extname);
         if (hduptr->extver!=-999) {
-            sprintf(extver,"(%d)",hduptr->extver);
+            snprintf(extver, sizeof(extver),"(%d)",hduptr->extver);
             strcat(extnv,extver);
         }
 
 #if (USE_LL_SUFFIX == 1)
-        sprintf(ctx->comm," %s  (%d columns x %lld rows)", extnv, hduptr->ncols,
+        snprintf(ctx->comm, sizeof(ctx->comm)," %s  (%d columns x %lld rows)", extnv, hduptr->ncols,
            hduptr->naxes[1]);
 #else
-        sprintf(ctx->comm," %s  (%d columns x %ld rows)", extnv, hduptr->ncols,
+        snprintf(ctx->comm, sizeof(ctx->comm)," %s  (%d columns x %ld rows)", extnv, hduptr->ncols,
            hduptr->naxes[1]);
 #endif
-        wrtout(out,ctx->comm);
+        wrtout(ctx, out,ctx->comm);
         if(hduptr->ncols) {
-           wrtout(out," ");
-           sprintf(ctx->comm, " Col# Name (Units)       Format"); 
-           wrtout(out,ctx->comm);
+           wrtout(ctx, out," ");
+           snprintf(ctx->comm, sizeof(ctx->comm), " Col# Name (Units)       Format");
+           wrtout(ctx, out,ctx->comm);
 	}    
         for ( i = 0; i < hduptr->ncols; i++) {
            if(strlen(ctx->tunit[i]))  
-               sprintf(extnv,"%s (%s)",ctx->ttype[i],ctx->tunit[i]); 
+               snprintf(extnv, sizeof(extnv),"%s (%s)",ctx->ttype[i],ctx->tunit[i]); 
            else 
-               sprintf(extnv,"%s",ctx->ttype[i]); 
- 	   sprintf(ctx->comm," %3d %-20.20s %-10.10s",
+               snprintf(extnv, sizeof(extnv),"%s",ctx->ttype[i]); 
+ 	   snprintf(ctx->comm, sizeof(ctx->comm)," %3d %-20.20s %-10.10s",
               i+1, extnv, ctx->tform[i]);
-	   wrtout(out,ctx->comm);
-        }  
+	   wrtout(ctx, out,ctx->comm);
+        }
     }      
     else if(hdutype == IMAGE_HDU && hduptr->isgroup) { 
 
-            sprintf(ctx->comm, " %d Random Groups, ",hduptr->gcount);
+            snprintf(ctx->comm, sizeof(ctx->comm), " %d Random Groups, ",hduptr->gcount);
 
-            switch(hduptr->bitpix) { 
-            	case BYTE_IMG: 
+            switch(hduptr->bitpix) {
+            	case BYTE_IMG:
                	    strcpy(temp," 8-bit integer pixels, ");
-               	    break; 
-                case SHORT_IMG: 
+               	    break;
+                case SBYTE_IMG:
+                   strcpy(temp," 8-bit signed byte pixels, ");
+                   break;
+                case SHORT_IMG:
                    strcpy(temp," 16-bit integer pixels, ");
-                   break; 
-                case USHORT_IMG: 
+                   break;
+                case USHORT_IMG:
                    strcpy(temp," 16-bit unsigned integer pixels, ");
-                   break; 
-                case LONG_IMG: 
+                   break;
+                case LONG_IMG:
                    strcpy(temp," 32-bit integer pixels, ");
-                   break; 
-                case LONGLONG_IMG: 
+                   break;
+                case LONGLONG_IMG:
                    strcpy(temp," 64-bit long integer pixels, ");
-                   break; 
-                case ULONG_IMG: 
+                   break;
+                case ULONG_IMG:
                    strcpy(temp," 32-bit unsigned integer pixels, ");
-                   break; 
-                case FLOAT_IMG: 
+                   break;
+                case ULONGLONG_IMG:
+                   strcpy(temp," 64-bit unsigned integer pixels, ");
+                   break;
+                case FLOAT_IMG:
                    strcpy(temp," 32-bit floating point pixels, ");
-                   break; 
-                case DOUBLE_IMG: 
+                   break;
+                case DOUBLE_IMG:
                    strcpy(temp," 64-bit double precision pixels, ");
-                   break; 
-                default: 
+                   break;
+                default:
                    strcpy(temp," unknown datatype, ");
-                   break; 
+                   break;
             }
 	    strcat(ctx->comm,temp);
 
-            sprintf(temp," %d axes ",hduptr->naxis);
+            snprintf(temp, sizeof(temp)," %d axes ",hduptr->naxis);
 	    strcat(ctx->comm,temp);
 
 #if (USE_LL_SUFFIX == 1)
-	    sprintf(temp, "(%lld",hduptr->naxes[0]);
+	    snprintf(temp, sizeof(temp), "(%lld",hduptr->naxes[0]);
 #else
-	    sprintf(temp, "(%ld",hduptr->naxes[0]);
+	    snprintf(temp, sizeof(temp), "(%ld",hduptr->naxes[0]);
 #endif
 	    strcat(ctx->comm,temp);
 
@@ -3161,67 +3701,73 @@ void print_summary(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
 	    for ( i = 1; i < hduptr->naxis; i++){ 
 	       npix *= hduptr->naxes[i];
 #if (USE_LL_SUFFIX == 1)
-	       sprintf(temp, " x %lld",hduptr->naxes[i]);
+	       snprintf(temp, sizeof(temp), " x %lld",hduptr->naxes[i]);
 #else
-	       sprintf(temp, " x %ld",hduptr->naxes[i]);
+	       snprintf(temp, sizeof(temp), " x %ld",hduptr->naxes[i]);
 #endif
 	       strcat(ctx->comm,temp);
             }  
 	    strcat(ctx->comm,"), ");
-            wrtout(out,ctx->comm);
+            wrtout(ctx, out,ctx->comm);
     }
-    else if(hdutype == IMAGE_HDU) { 
+    else if(hdutype == IMAGE_HDU) {
         if(hduptr->naxis > 0) {
 
 	    if(hduptr->hdunum == 1) {  
                 strcpy(extnv,"");
             } else { 
-                sprintf(extnv, "%s",hduptr->extname);
+                snprintf(extnv, sizeof(extnv), "%s",hduptr->extname);
                 if (hduptr->extver!=-999) {
-                   sprintf(extver," (%d)",hduptr->extver);
+                   snprintf(extver, sizeof(extver)," (%d)",hduptr->extver);
                    strcat(extnv,extver);
                 }
             }
 	    strcpy(ctx->comm,extnv);
 
-            switch(hduptr->bitpix) { 
-            	case BYTE_IMG: 
+            switch(hduptr->bitpix) {
+            	case BYTE_IMG:
                	    strcpy(temp," 8-bit integer pixels, ");
-               	    break; 
-                case SHORT_IMG: 
+               	    break;
+                case SBYTE_IMG:
+                   strcpy(temp," 8-bit signed byte pixels, ");
+                   break;
+                case SHORT_IMG:
                    strcpy(temp," 16-bit integer pixels, ");
-                   break; 
-                case USHORT_IMG: 
+                   break;
+                case USHORT_IMG:
                    strcpy(temp," 16-bit unsigned integer pixels, ");
-                   break; 
-                case LONG_IMG: 
+                   break;
+                case LONG_IMG:
                    strcpy(temp," 32-bit integer pixels, ");
-                   break; 
-                case LONGLONG_IMG: 
+                   break;
+                case LONGLONG_IMG:
                    strcpy(temp," 64-bit long integer pixels, ");
-                   break; 
-                case ULONG_IMG: 
+                   break;
+                case ULONG_IMG:
                    strcpy(temp," 32-bit unsigned integer pixels, ");
-                   break; 
-                case FLOAT_IMG: 
+                   break;
+                case ULONGLONG_IMG:
+                   strcpy(temp," 64-bit unsigned integer pixels, ");
+                   break;
+                case FLOAT_IMG:
                    strcpy(temp," 32-bit floating point pixels, ");
-                   break; 
-                case DOUBLE_IMG: 
+                   break;
+                case DOUBLE_IMG:
                    strcpy(temp," 64-bit double precision pixels, ");
-                   break; 
-                default: 
+                   break;
+                default:
                    strcpy(temp," unknown datatype, ");
-                   break; 
+                   break;
             }
 	    strcat(ctx->comm,temp);
 
-            sprintf(temp," %d axes ",hduptr->naxis);
+            snprintf(temp, sizeof(temp)," %d axes ",hduptr->naxis);
 	    strcat(ctx->comm,temp);
 
 #if (USE_LL_SUFFIX == 1)
-	    sprintf(temp, "(%lld",hduptr->naxes[0]);
+	    snprintf(temp, sizeof(temp), "(%lld",hduptr->naxes[0]);
 #else
-	    sprintf(temp, "(%ld",hduptr->naxes[0]);
+	    snprintf(temp, sizeof(temp), "(%ld",hduptr->naxes[0]);
 #endif
 	    strcat(ctx->comm,temp);
 
@@ -3229,21 +3775,21 @@ void print_summary(fv_context *ctx, fitsfile *infits, 	/* input fits file   */
 	    for ( i = 1; i < hduptr->naxis; i++){ 
 	       npix *= hduptr->naxes[i];
 #if (USE_LL_SUFFIX == 1)
-	       sprintf(temp, " x %lld",hduptr->naxes[i]);
+	       snprintf(temp, sizeof(temp), " x %lld",hduptr->naxes[i]);
 #else
-	       sprintf(temp, " x %ld",hduptr->naxes[i]);
+	       snprintf(temp, sizeof(temp), " x %ld",hduptr->naxes[i]);
 #endif
 	       strcat(ctx->comm,temp);
             }  
 	    strcat(ctx->comm,"), ");
-            wrtout(out,ctx->comm);
+            wrtout(ctx, out,ctx->comm);
         }
-        else{ 
-            sprintf(ctx->comm," Null data array; NAXIS = 0 ");
-            wrtout(out,ctx->comm);
-        }       
+        else{
+            snprintf(ctx->comm, sizeof(ctx->comm)," Null data array; NAXIS = 0 ");
+            wrtout(ctx, out,ctx->comm);
+        }
     }
-    wrtout(out," ");
+    wrtout(ctx, out," ");
     return;
 } 
 
@@ -3272,18 +3818,22 @@ void close_hdu(fv_context *ctx, FitsHdu *hduptr )
 	free(hduptr->datamax[i]);
 	free(hduptr->tnull[i]);
     }
-    if(hduptr->hdutype == ASCII_TBL && hduptr->hdutype == BINARY_TBL){
+    if(hduptr->hdutype == ASCII_TBL || hduptr->hdutype == BINARY_TBL){
 	if(hduptr->ncols > 0)free(ctx->ttype);
 	if(hduptr->ncols > 0)free(ctx->tunit);
 	if(hduptr->ncols > 0)free(ctx->tform);
     }
+    ctx->ttype = NULL;
+    ctx->tform = NULL;
+    ctx->tunit = NULL;
     if(hduptr->naxis) free(hduptr->naxes);
     if(hduptr->ncols > 0)free(hduptr->datamax);
     if(hduptr->ncols > 0)free(hduptr->datamin);
     if(hduptr->ncols > 0)free(hduptr->tnull);
     free(hduptr->kwds);
-    free(ctx->cards);
-    free(ctx->tmpkwds);
+    free(ctx->cards);    ctx->cards = NULL;
+    free(ctx->tmpkwds); ctx->tmpkwds = NULL;
+    ctx->ncards = 0;
     return;
 }
 

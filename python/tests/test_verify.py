@@ -1,4 +1,6 @@
 """Tests for the fitsverify Python package."""
+import io
+import json
 import os
 import sys
 import pytest
@@ -209,3 +211,238 @@ class TestRepr:
             r = repr(result.issues[0])
             assert "Issue(" in r
             assert "severity=" in r
+
+
+class TestFileLikeObject:
+    def test_binary_file_object(self):
+        """verify() accepts an open binary file."""
+        import fitsverify
+        path = _fits_path("valid_minimal.fits")
+        with open(path, 'rb') as f:
+            result = fitsverify.verify(f)
+        assert result.is_valid
+
+    def test_bytesio(self):
+        """verify() accepts a BytesIO object."""
+        import fitsverify
+        path = _fits_path("valid_minimal.fits")
+        with open(path, 'rb') as f:
+            data = f.read()
+        result = fitsverify.verify(io.BytesIO(data))
+        assert result.is_valid
+
+    def test_text_mode_raises(self):
+        """verify() rejects text-mode file-like objects."""
+        import fitsverify
+        with pytest.raises(TypeError, match="binary mode"):
+            fitsverify.verify(io.StringIO("not binary"))
+
+
+class TestToDict:
+    def test_issue_to_dict(self):
+        import fitsverify
+        result = fitsverify.verify(_fits_path("valid_minimal.fits"))
+        assert len(result.issues) > 0
+        d = result.issues[0].to_dict()
+        assert 'severity' in d
+        assert 'code' in d
+        assert 'hdu' in d
+        assert 'message' in d
+        assert isinstance(d['severity'], str)
+
+    def test_result_to_dict(self):
+        import fitsverify
+        result = fitsverify.verify(_fits_path("err_bad_bitpix.fits"))
+        d = result.to_dict()
+        assert d['is_valid'] is False
+        assert d['num_errors'] > 0
+        assert isinstance(d['messages'], list)
+        assert len(d['messages']) > 0
+        assert 'severity' in d['messages'][0]
+
+    def test_result_to_json(self):
+        import fitsverify
+        result = fitsverify.verify(_fits_path("valid_minimal.fits"))
+        j = result.to_json()
+        parsed = json.loads(j)
+        assert parsed['is_valid'] is True
+        assert parsed['num_errors'] == 0
+
+    def test_to_json_indent(self):
+        import fitsverify
+        result = fitsverify.verify(_fits_path("valid_minimal.fits"))
+        j = result.to_json(indent=2)
+        assert '\n' in j  # indented output has newlines
+        parsed = json.loads(j)
+        assert parsed['is_valid'] is True
+
+
+class TestAstropy:
+    def test_hdulist(self):
+        """verify() accepts an astropy HDUList."""
+        pytest.importorskip("astropy")
+        import fitsverify
+        from astropy.io import fits
+        hdulist = fits.open(_fits_path("valid_minimal.fits"))
+        result = fitsverify.verify(hdulist)
+        assert result.is_valid
+        hdulist.close()
+
+    def test_hdulist_with_errors(self):
+        """verify() detects errors in an astropy HDUList."""
+        pytest.importorskip("astropy")
+        import fitsverify
+        from astropy.io import fits
+        hdulist = fits.open(_fits_path("err_bad_bitpix.fits"))
+        result = fitsverify.verify(hdulist)
+        assert result.num_errors > 0
+        hdulist.close()
+
+
+class TestHints:
+    def test_no_hints_by_default(self):
+        """By default, fix_hint and explain are None."""
+        import fitsverify
+        result = fitsverify.verify(_fits_path("err_dup_extname.fits"))
+        for issue in result.issues:
+            assert issue.fix_hint is None
+            assert issue.explain is None
+
+    def test_fix_hints_on_warnings(self):
+        """fix_hints=True populates fix_hint on warning issues."""
+        import fitsverify
+        result = fitsverify.verify(
+            _fits_path("err_dup_extname.fits"), fix_hints=True)
+        warnings = result.warnings
+        assert len(warnings) > 0
+        for warn in warnings:
+            assert warn.fix_hint is not None
+            assert isinstance(warn.fix_hint, str)
+            assert len(warn.fix_hint) > 0
+            # explain should still be None
+            assert warn.explain is None
+
+    def test_explain_on_warnings(self):
+        """explain=True populates explain on warning issues."""
+        import fitsverify
+        result = fitsverify.verify(
+            _fits_path("err_dup_extname.fits"), explain=True)
+        warnings = result.warnings
+        assert len(warnings) > 0
+        for warn in warnings:
+            assert warn.explain is not None
+            assert isinstance(warn.explain, str)
+            assert len(warn.explain) > 0
+            # fix_hint should still be None
+            assert warn.fix_hint is None
+
+    def test_both_hints_and_explain(self):
+        """Both fix_hints and explain can be enabled simultaneously."""
+        import fitsverify
+        result = fitsverify.verify(
+            _fits_path("err_dup_extname.fits"), fix_hints=True, explain=True)
+        warnings = result.warnings
+        assert len(warnings) > 0
+        for warn in warnings:
+            assert warn.fix_hint is not None
+            assert warn.explain is not None
+
+    def test_hints_on_errors(self):
+        """fix_hints=True populates fix_hint on error issues."""
+        import fitsverify
+        result = fitsverify.verify(
+            _fits_path("err_bad_bitpix.fits"), fix_hints=True)
+        errors = result.errors
+        assert len(errors) > 0
+        # At least one error should have a hint
+        hinted = [e for e in errors if e.fix_hint is not None]
+        assert len(hinted) > 0
+
+    def test_info_messages_no_hints(self):
+        """INFO messages never have hints even when enabled."""
+        import fitsverify
+        from fitsverify import Severity
+        result = fitsverify.verify(
+            _fits_path("err_dup_extname.fits"), fix_hints=True, explain=True)
+        info_msgs = [i for i in result.issues if i.severity == Severity.INFO]
+        assert len(info_msgs) > 0
+        for info in info_msgs:
+            assert info.fix_hint is None
+            assert info.explain is None
+
+    def test_hints_in_to_dict(self):
+        """to_dict() includes hint fields when populated."""
+        import fitsverify
+        result = fitsverify.verify(
+            _fits_path("err_dup_extname.fits"), fix_hints=True)
+        warnings = result.warnings
+        assert len(warnings) > 0
+        d = warnings[0].to_dict()
+        assert 'fix_hint' in d
+        assert isinstance(d['fix_hint'], str)
+
+    def test_no_hints_not_in_dict(self):
+        """to_dict() omits hint fields when not populated."""
+        import fitsverify
+        result = fitsverify.verify(_fits_path("err_dup_extname.fits"))
+        warnings = result.warnings
+        assert len(warnings) > 0
+        d = warnings[0].to_dict()
+        assert 'fix_hint' not in d
+        assert 'explain' not in d
+
+    def test_hints_in_to_json(self):
+        """to_json() includes hint fields when populated."""
+        import fitsverify
+        result = fitsverify.verify(
+            _fits_path("err_dup_extname.fits"),
+            fix_hints=True, explain=True)
+        j = result.to_json()
+        parsed = json.loads(j)
+        warning_msgs = [m for m in parsed['messages']
+                        if m['severity'] == 'WARNING']
+        assert len(warning_msgs) > 0
+        assert 'fix_hint' in warning_msgs[0]
+        assert 'explain' in warning_msgs[0]
+
+    def test_hints_with_memory_verification(self):
+        """Hints work with in-memory verification too."""
+        import fitsverify
+        path = _fits_path("err_dup_extname.fits")
+        with open(path, 'rb') as f:
+            data = f.read()
+        result = fitsverify.verify(data, fix_hints=True)
+        warnings = result.warnings
+        assert len(warnings) > 0
+        for warn in warnings:
+            assert warn.fix_hint is not None
+
+
+class TestVerifyParallel:
+    def test_parallel_basic(self):
+        """verify_parallel() returns correct results."""
+        import fitsverify
+        files = [
+            _fits_path("valid_minimal.fits"),
+            _fits_path("err_bad_bitpix.fits"),
+        ]
+        results = fitsverify.verify_parallel(files, max_workers=2)
+        assert len(results) == 2
+        assert results[0].is_valid
+        assert not results[1].is_valid
+
+    def test_parallel_matches_sequential(self):
+        """verify_parallel() matches verify_all() results."""
+        import fitsverify
+        files = [
+            _fits_path("valid_minimal.fits"),
+            _fits_path("valid_multi_ext.fits"),
+            _fits_path("err_bad_bitpix.fits"),
+        ]
+        seq = fitsverify.verify_all(files)
+        par = fitsverify.verify_parallel(files, max_workers=2)
+        assert len(seq) == len(par)
+        for s, p in zip(seq, par):
+            assert s.is_valid == p.is_valid
+            assert s.num_errors == p.num_errors
+            assert s.num_warnings == p.num_warnings

@@ -1,5 +1,6 @@
 add_library(fitsverify
     src/fv_api.c
+    src/fv_hints.c
     src/fvrf_misc.c
     src/fvrf_key.c
     src/fvrf_file.c
@@ -13,7 +14,6 @@ target_include_directories(fitsverify
             ${CFITSIO_INCLUDE_DIRS}
 )
 
-target_compile_definitions(fitsverify PRIVATE STANDALONE ERR2OUT)
 
 if(CFITSIO_LIBRARY_DIRS)
     target_link_directories(fitsverify PUBLIC ${CFITSIO_LIBRARY_DIRS})

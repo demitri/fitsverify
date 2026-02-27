@@ -2,6 +2,8 @@
  * fitsverify — thin CLI wrapper around libfitsverify
  *
  * Supports all original flags: -l -H -q -e -h
+ * New flags: -s (severe only), --json (JSON output)
+ * Supports @filelist.txt syntax for file lists.
  * No globals, no stubs, no HEADAS/PIL/WEBTOOL code.
  */
 #include <stdio.h>
@@ -9,6 +11,196 @@
 #include <string.h>
 #include "fitsverify.h"
 #include "fitsio.h"
+
+/* ---- JSON output callback ----------------------------------------------- */
+
+typedef struct {
+    int          msg_count;
+    int          first_file;   /* for comma before file objects */
+    int          first_msg;    /* for comma before messages in current file */
+    int          in_file;      /* currently inside a file object */
+    FILE        *out;
+} json_state;
+
+static const char *severity_str(fv_msg_severity sev)
+{
+    switch (sev) {
+        case FV_MSG_INFO:    return "info";
+        case FV_MSG_WARNING: return "warning";
+        case FV_MSG_ERROR:   return "error";
+        case FV_MSG_SEVERE:  return "severe";
+        default:             return "unknown";
+    }
+}
+
+/* Escape a string for JSON output: handle \, ", and control characters */
+static void json_write_escaped(FILE *out, const char *s)
+{
+    fputc('"', out);
+    for (; *s; s++) {
+        switch (*s) {
+            case '"':  fputs("\\\"", out); break;
+            case '\\': fputs("\\\\", out); break;
+            case '\n': fputs("\\n", out); break;
+            case '\r': fputs("\\r", out); break;
+            case '\t': fputs("\\t", out); break;
+            default:
+                if ((unsigned char)*s < 0x20)
+                    fprintf(out, "\\u%04x", (unsigned char)*s);
+                else
+                    fputc(*s, out);
+                break;
+        }
+    }
+    fputc('"', out);
+}
+
+static void json_callback(const fv_message *msg, void *userdata)
+{
+    json_state *js = (json_state *)userdata;
+    FILE *out = js->out;
+
+    if (!js->first_msg) fprintf(out, ",\n");
+    js->first_msg = 0;
+
+    fprintf(out, "      {\"severity\": \"%s\", \"code\": %d, \"hdu\": %d, \"text\": ",
+            severity_str(msg->severity), (int)msg->code, msg->hdu_num);
+    json_write_escaped(out, msg->text);
+    if (msg->fix_hint) {
+        fprintf(out, ", \"fix_hint\": ");
+        json_write_escaped(out, msg->fix_hint);
+    }
+    if (msg->explain) {
+        fprintf(out, ", \"explain\": ");
+        json_write_escaped(out, msg->explain);
+    }
+    fprintf(out, "}");
+    js->msg_count++;
+}
+
+static void json_begin_file(json_state *js, const char *filename)
+{
+    FILE *out = js->out;
+
+    if (!js->first_file) fprintf(out, ",\n");
+    js->first_file = 0;
+    js->first_msg = 1;
+    js->msg_count = 0;
+    js->in_file = 1;
+
+    fprintf(out, "    {\n      \"file\": ");
+    json_write_escaped(out, filename);
+    fprintf(out, ",\n      \"messages\": [\n");
+}
+
+static void json_end_file(json_state *js, const fv_result *result, int vfstatus)
+{
+    FILE *out = js->out;
+
+    fprintf(out, "\n      ],\n");
+    fprintf(out, "      \"num_errors\": %d,\n", vfstatus ? 1 : result->num_errors);
+    fprintf(out, "      \"num_warnings\": %d,\n", result->num_warnings);
+    fprintf(out, "      \"num_hdus\": %d,\n", result->num_hdus);
+    fprintf(out, "      \"aborted\": %s\n", result->aborted ? "true" : "false");
+    fprintf(out, "    }");
+    js->in_file = 0;
+}
+
+/* ---- @filelist support -------------------------------------------------- */
+
+/*
+ * Read filenames from a text file, one per line.
+ * Returns a dynamically allocated array of strings (caller frees).
+ * Sets *count to the number of filenames read.
+ * Returns NULL on error.
+ */
+static char **read_filelist(const char *listpath, int *count)
+{
+    FILE *fp;
+    char line[FLEN_FILENAME];
+    int capacity = 64;
+    int n = 0;
+    char **files;
+
+    fp = fopen(listpath, "r");
+    if (!fp) {
+        fprintf(stderr, "Cannot open the list file: %s\n", listpath);
+        return NULL;
+    }
+
+    files = (char **)malloc(capacity * sizeof(char *));
+    if (!files) { fclose(fp); return NULL; }
+
+    while (fgets(line, sizeof(line), fp)) {
+        /* strip trailing whitespace/newline */
+        int len = (int)strlen(line);
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'
+                        || line[len-1] == ' '  || line[len-1] == '\t'))
+            line[--len] = '\0';
+
+        /* skip blank lines */
+        if (len == 0) continue;
+
+        if (n >= capacity) {
+            capacity *= 2;
+            files = (char **)realloc(files, capacity * sizeof(char *));
+            if (!files) { fclose(fp); return NULL; }
+        }
+
+        files[n] = (char *)malloc(len + 1);
+        if (!files[n]) { fclose(fp); return NULL; }
+        strcpy(files[n], line);
+        n++;
+    }
+
+    fclose(fp);
+    *count = n;
+    return files;
+}
+
+/* ---- verify_one_file ---------------------------------------------------- */
+
+static int verify_one_file(fv_context *ctx, const char *filename,
+                           int quiet, int json_mode, json_state *js)
+{
+    fv_result result;
+    FILE *out;
+    int vfstatus;
+
+    if (json_mode) {
+        json_begin_file(js, filename);
+        out = NULL;  /* suppress FILE* output; callback handles it */
+    } else {
+        out = quiet ? NULL : stdout;
+    }
+
+    vfstatus = fv_verify_file(ctx, filename, out, &result);
+
+    if (json_mode) {
+        json_end_file(js, &result, vfstatus);
+    }
+
+    if (quiet && !json_mode) {
+        int nerrs  = vfstatus ? 1 : result.num_errors;
+        int nwarns = result.num_warnings;
+        int filestatus = ((nerrs + nwarns) > 0) ? 1 : 0;
+
+        if (filestatus) {
+            if (fv_get_option(ctx, FV_OPT_ERR_REPORT))
+                printf("verification FAILED: %-20s, %d errors\n",
+                       filename, nerrs);
+            else
+                printf("verification FAILED: %-20s, %d warnings and %d errors\n",
+                       filename, nwarns, nerrs);
+        } else {
+            printf("verification OK: %-20s\n", filename);
+        }
+    }
+
+    return vfstatus;
+}
+
+/* ---- help and usage ----------------------------------------------------- */
 
 static void print_help(void)
 {
@@ -23,6 +215,10 @@ printf("          -H  test ESO HIERARCH keywords\n");
 printf("          -l  list all header keywords\n");
 printf("          -q  quiet; print one-line pass/fail summary per file\n");
 printf("          -e  only test for error conditions (ignore warnings)\n");
+printf("          -s  only test for severe error conditions\n");
+printf("       --json output results as JSON\n");
+printf("  --fix-hints show actionable fix suggestions for each error/warning\n");
+printf("    --explain show detailed explanations for each error/warning\n");
 printf(" \n");
 printf("   fitsverify exits with a status equal to the number of errors + warnings.\n");
 printf("        \n");
@@ -32,6 +228,7 @@ printf("                                  a single file, including a keyword lis
 printf("     fitsverify -q *.fits *.fit - verify all files with .fits or .fit\n");
 printf("                                  extensions, writing a 1-line pass/fail\n");
 printf("                                  message for each file\n");
+printf("     fitsverify --json *.fits   - output JSON verification results\n");
 printf(" \n");
 printf("DESCRIPTION:\n");
 printf("    \n");
@@ -129,19 +326,25 @@ static void print_usage(void)
     printf("          -l  list all header keywords\n");
     printf("          -q  quiet; print one-line pass/fail summary per file\n");
     printf("          -e  only test for error conditions; don't issue warnings\n");
+    printf("          -s  only test for severe error conditions\n");
+    printf("       --json output results as JSON\n");
+    printf("  --fix-hints show actionable fix suggestions for each error/warning\n");
+    printf("    --explain show detailed explanations for each error/warning\n");
     printf("\n");
     printf("Help:   fitsverify -h\n");
 }
 
+/* ---- main --------------------------------------------------------------- */
+
 int main(int argc, char *argv[])
 {
     fv_context *ctx;
-    fv_result result;
     int ii, file1 = 0, invalid = 0;
-    int quiet = 0;
+    int quiet = 0, json_mode = 0;
     float fversion;
     char banner[256];
     long toterr, totwrn;
+    json_state js;
 
     if (argc == 2 && !strcmp(argv[1], "-h")) {
         print_help();
@@ -157,11 +360,25 @@ int main(int argc, char *argv[])
     /* Match original fitsverify CLI behavior: HEASARC conventions off by default */
     fv_set_option(ctx, FV_OPT_HEASARC_CONV, 0);
 
-    /* check for flags on the command line */
+    /* check for flags on the command line (flags can appear anywhere) */
     for (ii = 1; ii < argc; ii++) {
-        if ((*argv[ii] != '-') || !strcmp(argv[ii], "-")) {
-            file1 = ii;
-            break;
+        /* long options */
+        if (!strcmp(argv[ii], "--json")) {
+            json_mode = 1;
+            continue;
+        }
+        if (!strcmp(argv[ii], "--fix-hints")) {
+            fv_set_option(ctx, FV_OPT_FIX_HINTS, 1);
+            continue;
+        }
+        if (!strcmp(argv[ii], "--explain")) {
+            fv_set_option(ctx, FV_OPT_EXPLAIN, 1);
+            continue;
+        }
+
+        if ((*argv[ii] != '-') || !strcmp(argv[ii], "-") || argv[ii][0] == '@') {
+            if (!file1) file1 = ii;
+            continue;
         }
 
         if (!strcmp(argv[ii], "-l")) {
@@ -170,6 +387,8 @@ int main(int argc, char *argv[])
             fv_set_option(ctx, FV_OPT_TESTHIERARCH, 1);
         } else if (!strcmp(argv[ii], "-e")) {
             fv_set_option(ctx, FV_OPT_ERR_REPORT, 1);
+        } else if (!strcmp(argv[ii], "-s")) {
+            fv_set_option(ctx, FV_OPT_ERR_REPORT, 2);
         } else if (!strcmp(argv[ii], "-q")) {
             fv_set_option(ctx, FV_OPT_PRSTAT, 0);
             quiet = 1;
@@ -184,13 +403,25 @@ int main(int argc, char *argv[])
         return 0;
     }
 
-    /* print banner */
-    if (!quiet) {
+    /* JSON mode: set up callback and suppress FILE* output */
+    if (json_mode) {
+        memset(&js, 0, sizeof(js));
+        js.first_file = 1;
+        js.out = stdout;
+        fv_set_output(ctx, json_callback, &js);
+        fprintf(stdout, "{\n  \"fitsverify_version\": \"%s\",\n", fv_version());
+        fits_get_version(&fversion);
+        fprintf(stdout, "  \"cfitsio_version\": \"%.3f\",\n", fversion);
+        fprintf(stdout, "  \"files\": [\n");
+    }
+
+    /* print banner (text mode only) */
+    if (!quiet && !json_mode) {
         FILE *out = stdout;
 
         fprintf(out, " \n");
         fits_get_version(&fversion);
-        sprintf(banner, "fitsverify %s (CFITSIO V%.3f)", fv_version(), fversion);
+        snprintf(banner, sizeof(banner), "fitsverify %s (CFITSIO V%.3f)", fv_version(), fversion);
         {
             int blen = (int)strlen(banner);
             int pad = (60 - blen) / 2;
@@ -214,37 +445,73 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* process each file */
+    /* process files (skip flags that were already parsed) */
     for (ii = file1; ii < argc; ii++) {
-        FILE *out = quiet ? NULL : stdout;
-        int vfstatus;
+        const char *arg = argv[ii];
 
-        vfstatus = fv_verify_file(ctx, argv[ii], out, &result);
+        /* skip flags intermixed with filenames */
+        if (!strcmp(arg, "--json") || !strcmp(arg, "--fix-hints") ||
+            !strcmp(arg, "--explain") ||
+            (!strcmp(arg, "-l") || !strcmp(arg, "-H") ||
+             !strcmp(arg, "-e") || !strcmp(arg, "-s") ||
+             !strcmp(arg, "-q")))
+            continue;
 
-        if (quiet) {
-            int nerrs  = vfstatus ? 1 : result.num_errors;
-            int nwarns = result.num_warnings;
-            int filestatus = ((nerrs + nwarns) > 0) ? 1 : 0;
-
-            if (filestatus) {
-                if (fv_get_option(ctx, FV_OPT_ERR_REPORT))
-                    printf("verification FAILED: %-20s, %d errors\n",
-                           argv[ii], nerrs);
-                else
-                    printf("verification FAILED: %-20s, %d warnings and %d errors\n",
-                           argv[ii], nwarns, nerrs);
-            } else {
-                printf("verification OK: %-20s\n", argv[ii]);
+        if (arg[0] == '@') {
+            /* @filelist: read filenames from text file */
+            int nfiles = 0, jj;
+            char **files = read_filelist(arg + 1, &nfiles);
+            if (!files) {
+                fv_context_free(ctx);
+                return 1;
             }
-        }
-
-        if (vfstatus) {
-            fv_context_free(ctx);
-            return vfstatus;
+            for (jj = 0; jj < nfiles; jj++) {
+                int vfstatus = verify_one_file(ctx, files[jj],
+                                               quiet, json_mode, &js);
+                free(files[jj]);
+                if (vfstatus) {
+                    /* free remaining filenames */
+                    int kk;
+                    for (kk = jj + 1; kk < nfiles; kk++) free(files[kk]);
+                    free(files);
+                    if (json_mode) {
+                        fprintf(stdout, "\n  ],\n");
+                        fv_get_totals(ctx, &toterr, &totwrn);
+                        fprintf(stdout, "  \"total_errors\": %ld,\n", toterr);
+                        fprintf(stdout, "  \"total_warnings\": %ld\n", totwrn);
+                        fprintf(stdout, "}\n");
+                    }
+                    fv_context_free(ctx);
+                    return vfstatus;
+                }
+            }
+            free(files);
+        } else {
+            /* regular filename */
+            int vfstatus = verify_one_file(ctx, arg, quiet, json_mode, &js);
+            if (vfstatus) {
+                if (json_mode) {
+                    fprintf(stdout, "\n  ],\n");
+                    fv_get_totals(ctx, &toterr, &totwrn);
+                    fprintf(stdout, "  \"total_errors\": %ld,\n", toterr);
+                    fprintf(stdout, "  \"total_warnings\": %ld\n", totwrn);
+                    fprintf(stdout, "}\n");
+                }
+                fv_context_free(ctx);
+                return vfstatus;
+            }
         }
     }
 
     fv_get_totals(ctx, &toterr, &totwrn);
+
+    if (json_mode) {
+        fprintf(stdout, "\n  ],\n");
+        fprintf(stdout, "  \"total_errors\": %ld,\n", toterr);
+        fprintf(stdout, "  \"total_warnings\": %ld\n", totwrn);
+        fprintf(stdout, "}\n");
+    }
+
     fv_context_free(ctx);
 
     if ((toterr + totwrn) > 255)

@@ -119,51 +119,51 @@ void hdus_summary(fv_context *ctx, FILE *out)
    char temp[FLEN_VALUE];
    char temp1[FLEN_VALUE];
 
-   wrtsep(out,'+'," Error Summary  ",60);
-   wrtout(out," ");
-   sprintf(ctx->comm," HDU#  Name (version)       Type             Warnings  Errors");
-   wrtout(out,ctx->comm);
+   wrtsep(ctx,out,'+'," Error Summary  ",60);
+   wrtout(ctx,out," ");
+   snprintf(ctx->comm, sizeof(ctx->comm)," HDU#  Name (version)       Type             Warnings  Errors");
+   wrtout(ctx,out,ctx->comm);
 
-   sprintf(ctx->comm," 1                          Primary Array    %-4d      %-4d  ",
+   snprintf(ctx->comm, sizeof(ctx->comm)," 1                          Primary Array    %-4d      %-4d  ",
 	   ctx->hduname[0]->wrnno,ctx->hduname[0]->errnum);
-   wrtout(out,ctx->comm);
+   wrtout(ctx,out,ctx->comm);
    for (i=2; i <= ctx->totalhdu; i++) {
        p = ctx->hduname[i-1];
        strcpy(temp,p->extname);
        if(p->extver && p->extver!= -999) {
-           sprintf(temp1," (%-d)",p->extver);
+           snprintf(temp1, sizeof(temp1)," (%-d)",p->extver);
            strcat(temp,temp1);
        }
        switch(ctx->hduname[i-1]->hdutype){
 	   case IMAGE_HDU:
-               sprintf(ctx->comm," %-5d %-20s Image Array      %-4d      %-4d  ",
+               snprintf(ctx->comm, sizeof(ctx->comm)," %-5d %-20s Image Array      %-4d      %-4d  ",
 	               i,temp, p->wrnno,p->errnum);
-               wrtout(out,ctx->comm);
+               wrtout(ctx,out,ctx->comm);
 	       break;
 	   case ASCII_TBL:
-               sprintf(ctx->comm," %-5d %-20s ASCII Table      %-4d      %-4d  ",
+               snprintf(ctx->comm, sizeof(ctx->comm)," %-5d %-20s ASCII Table      %-4d      %-4d  ",
 	               i,temp, p->wrnno,p->errnum);
-               wrtout(out,ctx->comm);
+               wrtout(ctx,out,ctx->comm);
 	       break;
 	   case BINARY_TBL:
-               sprintf(ctx->comm," %-5d %-20s Binary Table     %-4d      %-4d  ",
+               snprintf(ctx->comm, sizeof(ctx->comm)," %-5d %-20s Binary Table     %-4d      %-4d  ",
 	               i,temp, p->wrnno,p->errnum);
-               wrtout(out,ctx->comm);
+               wrtout(ctx,out,ctx->comm);
 	       break;
            default:
-               sprintf(ctx->comm," %-5d %-20s Unknown HDU      %-4d      %-4d  ",
+               snprintf(ctx->comm, sizeof(ctx->comm)," %-5d %-20s Unknown HDU      %-4d      %-4d  ",
 	               i,temp, p->wrnno,p->errnum);
-               wrtout(out,ctx->comm);
+               wrtout(ctx,out,ctx->comm);
 	       break;
       }
    }
    /* check the end of file */
    num_err_wrn(ctx, &ierr, &iwrn);
    if (iwrn || ierr) {
-     sprintf(ctx->comm," End-of-file %-30s  %-4d      %-4d  ", "", iwrn,ierr);
-     wrtout(out,ctx->comm);
+     snprintf(ctx->comm, sizeof(ctx->comm)," End-of-file %-30s  %-4d      %-4d  ", "", iwrn,ierr);
+     wrtout(ctx,out,ctx->comm);
    }
-   wrtout(out," ");
+   wrtout(ctx,out," ");
    return;
 }
 
@@ -174,6 +174,7 @@ void destroy_hduname(fv_context *ctx)
    int i;
    for (i=0; i < ctx->totalhdu; i++) free(ctx->hduname[i]);
    free(ctx->hduname);
+   ctx->hduname = NULL;
    return;
 }
 
@@ -190,32 +191,32 @@ void destroy_hduname(fv_context *ctx)
    /* check whether there are any HDU left */
    fits_movrel_hdu(infits,1, &hdutype, &status);
    if (!status) {
-       wrtout(out,"< End-of-File >");
-       sprintf(ctx->errmes,
+       wrtout(ctx,out,"< End-of-File >");
+       snprintf(ctx->errmes, sizeof(ctx->errmes),
     "There are extraneous HDU(s) beyond the end of last HDU.");
-       wrterr(ctx, out,ctx->errmes,2);
-       wrtout(out," ");
+       wrterr(ctx, out,ctx->errmes,2, FV_ERR_EXTRA_HDUS);
+       wrtout(ctx,out," ");
        return;
    }
 
    if (status != END_OF_FILE) {
-      wrtserr(ctx, out,"Bad HDU? ",&status,2);
+      wrtserr(ctx, out,"Bad HDU? ",&status,2, FV_ERR_CFITSIO_STACK);
       return;
    }
 
    status = 0;
    fits_clear_errmsg();
    if(ffghadll(infits, &headstart, &datastart, &dataend, &status))
-       wrtferr(ctx, out, "",&status,1);
+       wrtferr(ctx, out, "",&status,1, FV_ERR_CFITSIO);
 
    /* try to move to the last byte of this extension.  */
    if (ffmbyt(infits, dataend - 1,0,&status))
    {
-       sprintf(ctx->errmes,
+       snprintf(ctx->errmes, sizeof(ctx->errmes),
    "Error trying to read last byte of the file at byte %ld.", (long) dataend);
-       wrterr(ctx, out,ctx->errmes,2);
-       wrtout(out,"< End-of-File >");
-       wrtout(out," ");
+       wrterr(ctx, out,ctx->errmes,2, FV_ERR_READ_FAIL);
+       wrtout(ctx,out,"< End-of-File >");
+       wrtout(ctx,out," ");
        return;
    }
 
@@ -224,11 +225,11 @@ void destroy_hduname(fv_context *ctx)
 
    ffmbyt(infits, dataend,0,&status);
    if(status == 0) {
-       wrtout(out,"< End-of-File >");
-       sprintf(ctx->errmes,
+       wrtout(ctx,out,"< End-of-File >");
+       snprintf(ctx->errmes, sizeof(ctx->errmes),
      "File has extra byte(s) after last HDU at byte %ld.", (long) dataend);
-       wrterr(ctx, out,ctx->errmes,2);
-       wrtout(out," ");
+       wrterr(ctx, out,ctx->errmes,2, FV_ERR_EXTRA_BYTES);
+       wrtout(ctx,out," ");
    }
 
    return;
@@ -250,9 +251,9 @@ void init_report(fv_context *ctx,
                  char *rootnam          /* input file name */
                  )
 {
-    sprintf(ctx->comm,"\n%d Header-Data Units in this file.",ctx->totalhdu);
-    wrtout(out,ctx->comm);
-    wrtout(out," ");
+    snprintf(ctx->comm, sizeof(ctx->comm),"\n%d Header-Data Units in this file.",ctx->totalhdu);
+    wrtout(ctx,out,ctx->comm);
+    wrtout(ctx,out," ");
 
     reset_err_wrn(ctx);
     init_hduname(ctx);
@@ -281,9 +282,9 @@ void close_report(fv_context *ctx,
     ctx->file_total_err  = numerrs;
 
     /* get the total number of errors and warnnings */
-    sprintf(ctx->comm,"**** Verification found %d warning(s) and %d error(s). ****",
+    snprintf(ctx->comm, sizeof(ctx->comm),"**** Verification found %d warning(s) and %d error(s). ****",
               numwrns, numerrs);
-    wrtout(out,ctx->comm);
+    wrtout(ctx,out,ctx->comm);
 
     update_parfile(ctx, numerrs,numwrns);
     /* destroy the hdu name */
